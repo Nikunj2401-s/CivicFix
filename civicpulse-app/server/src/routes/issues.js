@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { q } from '../db.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
+import { reportLimiter, voteLimiter } from '../middleware/rateLimit.js';
 
 const r = Router();
 const DUPE_RADIUS_M = 50;
@@ -108,7 +109,7 @@ r.get('/:id', async (req, res) => {
 });
 
 /* file a report. The 50 m check runs again here so the API is safe on its own. */
-r.post('/', upload.single('photo'), async (req, res) => {
+r.post('/', reportLimiter, upload.single('photo'), async (req, res) => {
   const { category, description } = req.body;
   const lat = Number(req.body.latitude), lng = Number(req.body.longitude);
   const severity = Math.min(5, Math.max(1, Number(req.body.severity) || 3));
@@ -142,7 +143,7 @@ r.post('/', upload.single('photo'), async (req, res) => {
 });
 
 /* community upvotes */
-r.post('/:id/upvote', async (req, res) => {
+r.post('/:id/upvote', voteLimiter, async (req, res) => {
   const ins = await q(
     'INSERT INTO issue_upvotes (issue_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING issue_id',
     [req.params.id, req.user.id]

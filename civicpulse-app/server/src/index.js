@@ -3,6 +3,7 @@ import cors from 'cors';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
+import { apiLimiter } from './middleware/rateLimit.js';
 import authRoutes from './routes/auth.js';
 import issueRoutes from './routes/issues.js';
 
@@ -17,6 +18,10 @@ const dir = path.dirname(fileURLToPath(import.meta.url));
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(dir, 'uploads')));
+
+// behind a reverse proxy (nginx, Render, Railway) this makes req.ip the real client
+app.set('trust proxy', 1);
+app.use('/api', apiLimiter);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);

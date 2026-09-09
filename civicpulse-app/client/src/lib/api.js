@@ -30,6 +30,7 @@ export const api = {
   login: (body) => request('/auth/login', { method: 'POST', body }),
   me: () => request('/auth/me'),
   updateMe: (body) => request('/auth/me', { method: 'PATCH', body }),
+  setOffice: (body) => request('/auth/office', { method: 'PATCH', body }),
 
   issues: (params = {}) => {
     const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v && v !== 'all'));

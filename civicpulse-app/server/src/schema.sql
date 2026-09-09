@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS status_history (
   changed_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- an admin's depot or ward office, used as the starting point for directions
+ALTER TABLE users ADD COLUMN IF NOT EXISTS office_lat   double precision;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS office_lng   double precision;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS office_label text;
+
 -- the duplicate check hits this every time someone files a report
 CREATE INDEX IF NOT EXISTS idx_issues_cat_pos   ON issues (category, latitude, longitude);
 CREATE INDEX IF NOT EXISTS idx_issues_priority  ON issues (priority_score DESC);

@@ -10,7 +10,8 @@ export default {
         signal: '#c7422f',
         amber: '#d9962b',
         forest: '#2f7d5b',
-        ocean: '#2b6ca3'
+        ocean: '#2b6ca3',
+        violet: '#6a5aa8'
       },
       fontFamily: {
         sans: ['"Helvetica Neue"', 'Helvetica', 'Arial', '"Segoe UI"', 'system-ui', 'sans-serif']

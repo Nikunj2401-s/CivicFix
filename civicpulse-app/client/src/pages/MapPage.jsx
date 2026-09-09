@@ -1,14 +1,20 @@
 import { useMemo, useState } from 'react';
 import LeafletMap from '../components/LeafletMap.jsx';
-import { IssueRow, Empty } from '../components/Bits.jsx';
+import { IssueRow, Empty, RowSkeleton } from '../components/Bits.jsx';
 import IssueDetail from '../components/IssueDetail.jsx';
 import { CATEGORIES, STATUS } from '../lib/constants.js';
 
-export default function MapPage({ issues, you, reload }) {
+export default function MapPage({ issues, busy, you, reload }) {
   const [cats, setCats] = useState(new Set(Object.keys(CATEGORIES)));
   const [status, setStatus] = useState('all');
   const [sort, setSort] = useState('priority');
   const [open, setOpen] = useState(null);
+
+  const counts = useMemo(() => {
+    const c = {};
+    issues.forEach((i) => { c[i.category] = (c[i.category] || 0) + 1; });
+    return c;
+  }, [issues]);
 
   const shown = useMemo(() => {
     const list = issues.filter((i) => cats.has(i.category) && (status === 'all' || i.status === status));
@@ -25,23 +31,34 @@ export default function MapPage({ issues, you, reload }) {
     next.has(k) ? next.delete(k) : next.add(k);
     setCats(next);
   };
+  const allOn = cats.size === Object.keys(CATEGORIES).length;
 
-  const centre = you || (issues[0] ? [issues[0].latitude, issues[0].longitude] : [28.6139, 77.209]);
+  const centre = you || (issues[0] ? [issues[0].latitude, issues[0].longitude] : [20.5937, 78.9629]);
   const openCount = issues.filter((i) => i.status !== 'resolved').length;
 
   return (
-    <div className="grid h-full grid-rows-[45%_55%] md:grid-cols-[352px_1fr] md:grid-rows-1">
+    <div className="grid h-full grid-rows-[46%_54%] md:grid-cols-[368px_1fr] md:grid-rows-1">
       <aside className="order-2 flex min-h-0 flex-col border-rule bg-white md:order-1 md:border-r">
         <div className="border-b border-rule-2 p-4">
-          <h2 className="text-[15px] font-semibold tracking-tight">Open issues nearby</h2>
-          <p className="num mb-3 text-[12.5px] text-ink-2">
-            {issues.length} reported · {openCount} still open
-          </p>
+          <div className="mb-3 flex items-baseline justify-between gap-2">
+            <h2 className="text-[15px] font-semibold tracking-tight">Issues nearby</h2>
+            <span className="num text-[12px] text-ink-2">
+              <b className="text-ink">{openCount}</b> open of {issues.length}
+            </span>
+          </div>
+
           <div className="flex flex-wrap gap-1.5">
+            <button
+              onClick={() => setCats(allOn ? new Set() : new Set(Object.keys(CATEGORIES)))}
+              className="chip text-[11.5px] font-semibold"
+            >
+              {allOn ? 'Clear all' : 'Select all'}
+            </button>
             {Object.entries(CATEGORIES).map(([k, c]) => (
               <button key={k} onClick={() => toggle(k)} className={`chip ${cats.has(k) ? 'chip-on' : ''}`}>
                 <span className="h-2 w-2 rounded-sm" style={{ background: c.color }} />
                 {c.label}
+                <span className="num opacity-60">{counts[k] || 0}</span>
               </button>
             ))}
           </div>
@@ -59,11 +76,13 @@ export default function MapPage({ issues, you, reload }) {
           </select>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-auto">
-          {shown.length ? (
+        <div className="min-h-0 flex-1 overflow-auto scroll-thin">
+          {busy && !issues.length ? (
+            <RowSkeleton />
+          ) : shown.length ? (
             shown.map((i) => <IssueRow key={i.id} issue={i} onClick={() => setOpen(i.id)} />)
           ) : (
-            <Empty title="Nothing matches those filters">
+            <Empty title="Nothing matches those filters" glyph="⌕">
               Turn a category back on, or file the first report for this area.
             </Empty>
           )}

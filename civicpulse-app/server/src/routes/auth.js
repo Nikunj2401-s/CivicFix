@@ -1,12 +1,18 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { q } from '../db.js';
-import { sign, requireAuth } from '../middleware/auth.js';
+import { sign, requireAuth, requireAdmin } from '../middleware/auth.js';
+import { authLimiter } from '../middleware/rateLimit.js';
 
 const r = Router();
-const shape = (u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, created_at: u.created_at });
+const shape = (u) => ({
+  id: u.id, name: u.name, email: u.email, role: u.role, created_at: u.created_at,
+  office: u.office_lat != null && u.office_lng != null
+    ? { latitude: u.office_lat, longitude: u.office_lng, label: u.office_label || 'Ward office' }
+    : null
+});
 
-r.post('/register', async (req, res) => {
+r.post('/register', authLimiter, async (req, res) => {
   const name = (req.body.name || '').trim();
   const email = (req.body.email || '').trim().toLowerCase();
   const password = req.body.password || '';
@@ -24,7 +30,7 @@ r.post('/register', async (req, res) => {
   res.status(201).json({ token: sign(rows[0]), user: shape(rows[0]) });
 });
 
-r.post('/login', async (req, res) => {
+r.post('/login', authLimiter, async (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase();
   const { rows } = await q('SELECT * FROM users WHERE email = $1', [email]);
   const user = rows[0];
@@ -51,6 +57,20 @@ r.patch('/me', requireAuth, async (req, res) => {
   const name = (req.body.name || '').trim();
   if (!name) return res.status(400).json({ error: 'Name cannot be empty.' });
   const { rows } = await q('UPDATE users SET name = $1 WHERE id = $2 RETURNING *', [name, req.user.id]);
+  res.json({ user: shape(rows[0]) });
+});
+
+/* where the crew starts from — admin only */
+r.patch('/office', requireAuth, requireAdmin, async (req, res) => {
+  const lat = Number(req.body.latitude), lng = Number(req.body.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ error: 'Give the office a latitude and longitude.' });
+  }
+  const label = (req.body.label || 'Ward office').trim().slice(0, 80);
+  const { rows } = await q(
+    'UPDATE users SET office_lat = $1, office_lng = $2, office_label = $3 WHERE id = $4 RETURNING *',
+    [lat, lng, label, req.user.id]
+  );
   res.json({ user: shape(rows[0]) });
 });
 

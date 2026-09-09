@@ -25,6 +25,8 @@ export function AuthProvider({ children }) {
     login: (email, password) => api.login({ email, password }).then(finish),
     register: (name, email, password) => api.register({ name, email, password }).then(finish),
     updateName: (name) => api.updateMe({ name }).then(({ user }) => setUser(user)),
+    saveOffice: (latitude, longitude, label) =>
+      api.setOffice({ latitude, longitude, label }).then(({ user }) => setUser(user)),
     logout: () => { setToken(null); setUser(null); }
   };
 
