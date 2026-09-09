@@ -1,4 +1,5 @@
-# CivicPulse
+# CivicFix
+
 
 Report civic issues, see them on a map, back your neighbours' reports, and let the
 ward office work the queue by priority. React + Tailwind on the front, Node + Express
