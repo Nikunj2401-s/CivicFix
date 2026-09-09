@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, Route, Switch, useLocation } from "wouter";
 import L from "leaflet";
+import exifr from "exifr";
 import "leaflet/dist/leaflet.css";
 import {
-  Activity, AlertTriangle, ArrowDownUp, ArrowRight, Bell, Check, CircleHelp, ClipboardList,
+  Activity, AlertTriangle, ArrowDownUp, ArrowRight, Bell, Check, CheckCircle2, CircleHelp, ClipboardList,
   CloudUpload, FilePlus2, Filter, Flag, Gauge, Lightbulb, ListFilter, LocateFixed,
   LockKeyhole, Map as MapIcon, Menu, Navigation, Plus, Search, ShieldCheck,
   SlidersHorizontal, ThumbsUp, X,
 } from "lucide-react";
 import {
-  backIssue, createIssue, findNearbyIssues, getCurrentUser, getIssues, getMyReports,
+  backIssue, checkLand, createIssue, verifyIssue, signInWithGoogle, findNearbyIssues, getCurrentUser, getIssues, getMyReports,
   distanceInMeters, register, signIn, updateIssueStatus, upvoteIssue, isAuthed, signOut,
 } from "./lib/api";
 
@@ -276,6 +277,67 @@ function StatusTimeline({ status }) {
   );
 }
 
+function VerificationPanel({ issue }) {
+  const [busy, setBusy] = useState(false);
+  const [verdict, setVerdict] = useState(issue.my_verdict || null);
+  const [note, setNote] = useState("");
+  const [counts, setCounts] = useState({
+    confirmations: Number(issue.confirmations || 0),
+    disputes: Number(issue.disputes || 0)
+  });
+  const confirmations = counts.confirmations;
+  const disputes = counts.disputes;
+  const total = confirmations + disputes;
+  const trust = total ? Math.round((confirmations / total) * 100) : null;
+
+  const cast = async (next) => {
+    setBusy(true);
+    setNote("");
+    try {
+      const updated = await verifyIssue(issue.id, next);
+      setVerdict(next);
+      setCounts({
+        confirmations: Number(updated.confirmations || 0),
+        disputes: Number(updated.disputes || 0)
+      });
+    } catch (error) {
+      setNote(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="verify-panel" data-testid={`panel-verify-${issue.id}`}>
+      <div className="verify-head">
+        <div>
+          <div className="eyebrow">Community check</div>
+          <p className="subhead">Seen this yourself? Residents verify each report so the ward office knows what is real.</p>
+        </div>
+        {trust !== null && (
+          <div className={`trust-badge ${trust >= 60 ? "trust-good" : trust >= 40 ? "trust-mixed" : "trust-poor"}`} data-testid={`badge-trust-${issue.id}`}>
+            <strong>{trust}%</strong>
+            <span>{total} checked</span>
+          </div>
+        )}
+      </div>
+      <div className="verify-counts">
+        <span data-testid={`text-confirmations-${issue.id}`}><CheckCircle2 size={14} />{confirmations} confirmed it is there</span>
+        <span data-testid={`text-disputes-${issue.id}`}><X size={14} />{disputes} could not find it</span>
+      </div>
+      <div className="verify-actions">
+        <button type="button" className={`button ${verdict === "confirm" ? "button-primary" : "button-secondary"}`} disabled={busy} onClick={() => cast("confirm")} data-testid={`button-confirm-${issue.id}`}>
+          <CheckCircle2 size={14} />{verdict === "confirm" ? "You confirmed this" : "I can see it"}
+        </button>
+        <button type="button" className={`button ${verdict === "dispute" ? "button-primary" : "button-secondary"}`} disabled={busy} onClick={() => cast("dispute")} data-testid={`button-dispute-${issue.id}`}>
+          <X size={14} />{verdict === "dispute" ? "You disputed this" : "Not there any more"}
+        </button>
+      </div>
+      {note && <div className="help-text">{note}</div>}
+    </div>
+  );
+}
+
 function IssueDetailModal({ issue, onClose, onUpvote, canBack = true }) {
   const [isBacking, setIsBacking] = useState(false);
   const [backed, setBacked] = useState(issue?.backed_by_me);
@@ -307,6 +369,7 @@ function IssueDetailModal({ issue, onClose, onUpvote, canBack = true }) {
           </div>
           <div className="detail-timeline"><div className="eyebrow">Status trail</div><StatusTimeline status={issue.status} /></div>
         </div>
+        <VerificationPanel issue={issue} />
         <div className="modal-actions">
           <button className="button button-secondary" onClick={onClose} data-testid="button-dismiss-detail">Close</button>
           {canBack && <button className="button button-amber" disabled={backed || isBacking} onClick={handleBack} data-testid={`button-back-issue-${issue.id}`}><ThumbsUp size={15} />{backed ? "Backed by you" : isBacking ? "Recording…" : "Back this issue"}</button>}
@@ -386,7 +449,7 @@ function MapPage() {
   return (
     <AppShell title="Issue map">
       <div className="page">
-        <PageHeader eyebrow="Ward 154 · Bengaluru" title="See what needs fixing." description="A shared register of street-level issues. Back a report to make resident priorities visible to the ward office." action={<Link href="/report" className="button button-amber" data-testid="link-report-from-map"><FilePlus2 size={15} />Report an issue</Link>} />
+        <PageHeader eyebrow="your ward · " title="See what needs fixing." description="A shared register of street-level issues. Back a report to make resident priorities visible to the ward office." action={<Link href="/report" className="button button-amber" data-testid="link-report-from-map"><FilePlus2 size={15} />Report an issue</Link>} />
         <div className="stat-grid">
           <div className="stat-card featured"><div className="stat-label">Open register</div><div className="stat-value">{issues.filter((issue) => issue.status !== "resolved").length}</div><div className="stat-meta">issues awaiting or receiving action</div></div>
           <div className="stat-card"><div className="stat-label">Urgent attention</div><div className="stat-value band-red">{urgentCount}</div><div className="stat-meta">priority score 65 and above</div></div>
@@ -400,7 +463,7 @@ function MapPage() {
         </div>
         <CategoryFilterChips issues={issues} value={category} onChange={setCategory} />
         <div className="map-layout">
-          <section className="panel map-panel"><div className="panel-header"><div><h2>Live issue map</h2><p>{filtered.length} visible reports · select a pin or queue item</p></div><button className="quiet-button" onClick={() => setToast("Map is centred on Ward 154.")} data-testid="button-centre-map"><LocateFixed size={14} />Centre ward</button></div>{isLoading ? <LoadingPanel /> : error ? <ErrorPanel onRetry={refresh} /> : <MapCanvas issues={filtered} onSelect={setSelected} />}</section>
+          <section className="panel map-panel"><div className="panel-header"><div><h2>Live issue map</h2><p>{filtered.length} visible reports · select a pin or queue item</p></div><button className="quiet-button" onClick={() => setToast("Map is centred on your ward.")} data-testid="button-centre-map"><LocateFixed size={14} />Centre ward</button></div>{isLoading ? <LoadingPanel /> : error ? <ErrorPanel onRetry={refresh} /> : <MapCanvas issues={filtered} onSelect={setSelected} />}</section>
           <section className="panel"><div className="panel-header"><div><h2>Priority queue</h2><p>Ordered by score, highest first</p></div><ListFilter size={17} color="var(--muted)" /></div>{isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filtered.length ? <div className="issue-queue">{filtered.map((issue) => <IssueQueueCard key={issue.id} issue={issue} onSelect={setSelected} />)}</div> : <div className="empty-state" data-testid="state-empty-map"><Filter size={27} /><strong>No matching reports</strong><p>Try clearing a filter or searching another term.</p></div>}</section>
         </div>
       </div>
@@ -477,6 +540,14 @@ function ReportPage() {
   const [geoState, setGeoState] = useState("locating");   // locating | ready | blocked | manual
   const [photoName, setPhotoName] = useState("");
   const [photoPreview, setPhotoPreview] = useState("");
+  const [mediaFile, setMediaFile] = useState(null);
+  const [mediaKind, setMediaKind] = useState("photo");
+  const [exifInfo, setExifInfo] = useState(null);
+  const [videoFile, setVideoFile] = useState(null);
+  const [videoName, setVideoName] = useState("");
+  const [videoPreview, setVideoPreview] = useState("");
+  const [land, setLand] = useState(null);
+  const [devicePos, setDevicePos] = useState(null);
   const [addressQuery, setAddressQuery] = useState("");
   const [lookupMessage, setLookupMessage] = useState("");
   const [nearby, setNearby] = useState([]);
@@ -494,6 +565,7 @@ function ReportPage() {
     navigator.geolocation.getCurrentPosition(
       (position) => {
         setCoordinates(position.coords.latitude, position.coords.longitude);
+        setDevicePos([position.coords.latitude, position.coords.longitude]);
         setAccuracy(position.coords.accuracy);
         setGeoState("ready");
         if (announce) setToast("Pin moved to your current location.");
@@ -503,6 +575,56 @@ function ReportPage() {
     );
   };
   useEffect(() => { locateMe(); }, []);
+  /* Photos may carry a GPS tag. We read it to show where the picture was actually
+     taken, but never reject a file for lacking one. */
+  const handleMedia = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const isVideo = file.type.startsWith("video/");
+    setMediaFile(file);
+    setMediaKind(isVideo ? "video" : "photo");
+    setPhotoName(file.name);
+    setPhotoPreview(URL.createObjectURL(file));
+    setExifInfo(null);
+    if (isVideo) return;
+    try {
+      const gps = await exifr.gps(file);
+      if (gps && Number.isFinite(gps.latitude)) {
+        const drift = latitude && longitude
+          ? metresBetween([Number(latitude), Number(longitude)], [gps.latitude, gps.longitude])
+          : null;
+        const gap = devicePos ? metresBetween(devicePos, [gps.latitude, gps.longitude]) : null;
+        setExifInfo({ hasGps: true, latitude: gps.latitude, longitude: gps.longitude, drift, gap });
+        setCoordinates(gps.latitude, gps.longitude);   // the camera knows best
+        setGeoState("exif");
+      } else {
+        setExifInfo({ hasGps: false });
+      }
+    } catch { setExifInfo({ hasGps: false }); }
+  };
+
+  const handleVideo = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setVideoFile(file);
+    setVideoName(file.name);
+    setVideoPreview(URL.createObjectURL(file));
+  };
+
+  /* Land-use check, debounced so dragging the pin does not hammer the service. */
+  useEffect(() => {
+    if (!latitude || !longitude) return undefined;
+    let cancelled = false;
+    setLand(null);
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await checkLand(Number(latitude), Number(longitude));
+        if (!cancelled) setLand(result);
+      } catch { /* the server decides at submit time anyway */ }
+    }, 700);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [latitude, longitude]);
+
   const lookupAddress = async () => {
     const query = addressQuery.trim();
     if (query.length < 3) { setLookupMessage("Type at least three characters."); return; }
@@ -524,14 +646,16 @@ function ReportPage() {
   const submitReport = async (force = false) => {
     if (!description.trim() || submitting) return;
     if (!latitude || !longitude) { setToast("Set a location before filing."); return; }
+    if (!mediaFile || !exifInfo?.hasGps) { setToast("A geotagged photo is required."); return; }
+    if (!videoFile) { setToast("A short video is required."); return; }
     setSubmitting(true);
     const location = { latitude: Number(latitude), longitude: Number(longitude) };
     if (!force) {
       const matches = await findNearbyIssues(location.latitude, location.longitude, 50, category);
       if (matches.length) { setNearby(matches.map((issue) => ({ ...issue, distance_meters: distanceInMeters(location, issue) }))); setSubmitting(false); return; }
     }
-    await createIssue({ category, description: description.trim(), severity, latitude: location.latitude, longitude: location.longitude, photo_url: photoPreview });
-    setSubmitting(false); setNearby([]); setToast("Report added to the Ward 154 register."); setDescription(""); setPhotoName(""); setPhotoPreview("");
+    await createIssue({ category, description: description.trim(), severity, latitude: location.latitude, longitude: location.longitude, photo_url: photoPreview, photo_file: mediaFile, video_file: videoFile, pinned_by_hand: geoState === "manual", device_lat: devicePos?.[0], device_lng: devicePos?.[1] });
+    setSubmitting(false); setNearby([]); setToast("Report added to the your ward register."); setDescription(""); setPhotoName(""); setPhotoPreview("");
     window.setTimeout(() => setLocation("/my-reports"), 700);
   };
   const supportAndGo = async (issue) => { await backIssue(issue.id); setNearby([]); setSubmitting(false); setToast(`You backed ${issue.id}. No duplicate was filed.`); window.setTimeout(() => setLocation("/map"), 700); };
@@ -548,6 +672,20 @@ function ReportPage() {
               <div className="field"><label htmlFor="issue-category">Category</label><select id="issue-category" className="filter-select" value={category} onChange={(event) => setCategory(event.target.value)} data-testid="select-report-category">{Object.entries(CATEGORY_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></div>
               <div className="field"><label>Severity</label><div className="range-row"><input type="range" min="1" max="5" value={severity} onChange={(event) => setSeverity(Number(event.target.value))} data-testid="input-report-severity" /><div className="severity-value" data-testid="text-report-severity">{severity}</div></div><div className="help-text">1 is inconvenient. 5 is an immediate safety concern.</div></div>
               <div className="field full"><label htmlFor="issue-description">Description</label><textarea id="issue-description" className="textarea" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Example: A deep pothole opens across the left lane, 20m after the bus stop…" data-testid="input-report-description" /><div className="help-text">{description.length}/500 characters</div></div>
+              <div className="field full">
+                <div className="selected-category" data-testid="text-selected-category">
+                  <span className="eyebrow">Filing under</span>
+                  <strong>{CATEGORY_LABELS[category]}</strong>
+                  <span className="chip-note">severity {severity} · {severity * 10} points before backing</span>
+                </div>
+                {land && (
+                  <div className={`land-note land-${land.land_class}`} data-testid="text-land-class">
+                    {land.land_class === "public" && <><ShieldCheck size={14} /><span><strong>Public land.</strong> {land.land_note}</span></>}
+                    {land.land_class === "private" && <><AlertTriangle size={14} /><span><strong>This looks like private property.</strong> {land.land_note} The register covers roads, footpaths, drains and public spaces{land.enforced ? " — this report will be refused" : ""}.</span></>}
+                    {land.land_class === "unknown" && <><CircleHelp size={14} /><span>{land.land_note}</span></>}
+                  </div>
+                )}
+              </div>
               <div className="field full"><label htmlFor="report-address-search">Find a landmark</label><div className="location-search"><input id="report-address-search" className="input" value={addressQuery} onChange={(event) => setAddressQuery(event.target.value)} placeholder="Try Infantry Road or Russell Market" data-testid="input-report-address-search" /><button type="button" className="button button-secondary" onClick={lookupAddress} data-testid="button-lookup-address"><Search size={14} />Find location</button></div><div className="help-text">{lookupMessage || "Searches OpenStreetMap for a street or landmark."}</div></div>
               <div className="field full">
                 <label>Your location</label>
@@ -571,9 +709,52 @@ function ReportPage() {
               <div className="field full"><ReportLocationMap latitude={latitude} longitude={longitude} onChange={(nextLat, nextLng) => { setCoordinates(nextLat, nextLng); setGeoState("manual"); }} /></div>
               <div className="field"><label htmlFor="report-latitude">Latitude</label><input id="report-latitude" className="input" value={latitude} onChange={(event) => setLatitude(event.target.value)} data-testid="input-report-latitude" /></div>
               <div className="field"><label htmlFor="report-longitude">Longitude</label><input id="report-longitude" className="input" value={longitude} onChange={(event) => setLongitude(event.target.value)} data-testid="input-report-longitude" /></div>
-              <div className="field full"><label>Photo evidence <span style={{ color: "var(--muted-2)", fontFamily: "var(--font-sans)", textTransform: "none", letterSpacing: 0 }}>(optional)</span></label><label className="upload-box" htmlFor="issue-photo">{photoPreview ? <img className="upload-preview" src={photoPreview} alt="Selected street evidence preview" /> : <CloudUpload size={20} />}<strong>{photoName || "Add a street-level photo"}</strong><span className="help-text">Stored locally for this demo</span><input id="issue-photo" type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; setPhotoName(file.name); const reader = new FileReader(); reader.onload = () => setPhotoPreview(typeof reader.result === "string" ? reader.result : ""); reader.readAsDataURL(file); }} data-testid="input-report-photo" /></label></div>
+              <div className="field full"><label>Photo evidence <span className="req-mark">geotagged, required</span></label><label className="upload-box" htmlFor="issue-photo">{photoPreview ? (mediaKind === "video" ? <video className="upload-preview" src={photoPreview} controls /> : <img className="upload-preview" src={photoPreview} alt="Selected street evidence preview" />) : <CloudUpload size={20} />}<strong>{photoName || "Add a street-level photo"}</strong><span className="help-text">Must carry a GPS tag — use your phone's camera app with location on</span><input id="issue-photo" type="file" accept="image/*" onChange={handleMedia} data-testid="input-report-photo" /></label>
+                {exifInfo && (
+                  <div className={`geo-tag-note ${exifInfo.hasGps ? "geo-ok" : "geo-bad"}`} data-testid="text-exif-status">
+                    {exifInfo.hasGps ? (
+                      <>
+                        <strong>Location tag found.</strong> The camera recorded{" "}
+                        <span className="mono">{exifInfo.latitude.toFixed(5)}, {exifInfo.longitude.toFixed(5)}</span>, and the
+                        pin has been moved there. That coordinate is what gets filed.
+                        {exifInfo.gap !== null && exifInfo.gap > 150 && (
+                          <div className="mismatch-alert" data-testid="text-exif-mismatch">
+                            <AlertTriangle size={14} />
+                            <span>
+                              <strong>The issue location is not where this photo was taken.</strong> The camera was
+                              {" "}{formatKm(exifInfo.gap)} from where your device says you are now. Report the issue from
+                              where it is, using a picture taken there — this report will be refused.
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <strong>This photo has no location tag, so it cannot be used.</strong> Take the picture
+                        with your phone's camera app with location switched on. Photos captured inside a browser,
+                        screenshots, and anything sent through WhatsApp have the tag stripped.
+                      </>
+                    )}
+                  </div>
+                )}</div>
+
+              <div className="field full">
+                <label>Video evidence <span className="req-mark">required</span></label>
+                <label className="upload-box" htmlFor="issue-video">
+                  {videoPreview ? <video className="upload-preview" src={videoPreview} controls /> : <CloudUpload size={20} />}
+                  <strong>{videoName || "Add a short clip of the issue"}</strong>
+                  <span className="help-text">A few seconds is enough. Moving footage is far harder to fake than a still.</span>
+                  <input id="issue-video" type="file" accept="video/*" onChange={handleVideo} data-testid="input-report-video" />
+                </label>
+              </div>
             </div>
-            <div className="form-actions"><Link href="/map" className="button button-secondary" data-testid="link-cancel-report">Cancel</Link><button className="button button-primary" disabled={!description.trim() || submitting} onClick={() => submitReport(false)} data-testid="button-submit-report">{submitting ? "Checking nearby reports…" : "Review and file report"}<ArrowRight size={15} /></button></div>
+            <div className="form-actions">
+              <div className="evidence-checklist" data-testid="list-evidence-checklist">
+                <span className={mediaFile && exifInfo?.hasGps ? "done" : ""}>{mediaFile && exifInfo?.hasGps ? "✓" : "○"} Geotagged photo</span>
+                <span className={videoFile ? "done" : ""}>{videoFile ? "✓" : "○"} Video clip</span>
+                <span className={description.trim().length >= 10 ? "done" : ""}>{description.trim().length >= 10 ? "✓" : "○"} Description</span>
+              </div>
+              <Link href="/map" className="button button-secondary" data-testid="link-cancel-report">Cancel</Link><button className="button button-primary" disabled={!description.trim() || submitting || !mediaFile || !exifInfo?.hasGps || !videoFile || (land?.land_class === "private" && land?.enforced) || (exifInfo?.gap !== null && exifInfo?.gap > 150)} onClick={() => submitReport(false)} data-testid="button-submit-report">{submitting ? "Checking nearby reports…" : "Review and file report"}<ArrowRight size={15} /></button></div>
           </section>
           <aside className="panel info-panel"><div className="eyebrow">How CivicFix works</div><h3 style={{ marginTop: 7 }}>From street view to ward action</h3><div style={{ marginTop: 20 }}><div className="process-step"><div className="step-number">01</div><div><strong>Describe the street problem</strong><p>Use a landmark and a plain-language description.</p></div></div><div className="process-step"><div className="step-number">02</div><div><strong>Check for duplicates</strong><p>We look within 50 metres before creating a new entry.</p></div></div><div className="process-step"><div className="step-number">03</div><div><strong>Track accountable action</strong><p>The ward office updates the status as work moves forward.</p></div></div></div><div className="auth-note" style={{ marginTop: 3 }}><ShieldCheck size={15} style={{ verticalAlign: "-3px", marginRight: 5 }} />Your report is visible to residents in this ward.</div></aside>
         </div>
@@ -596,7 +777,7 @@ function MyReportsPage() {
       <div className="page">
         <PageHeader eyebrow="Resident activity" title="Your reports, in the open." description="Follow what you raised, see resident backing, and keep the ward office accountable to a visible status." action={<Link href="/report" className="button button-amber" data-testid="link-report-from-my-reports"><FilePlus2 size={15} />New report</Link>} />
         <div className="stat-grid">
-          <div className="stat-card featured"><div className="stat-label">Reports filed</div><div className="stat-value">{issues.length}</div><div className="stat-meta">in the Ward 154 register</div></div>
+          <div className="stat-card featured"><div className="stat-label">Reports filed</div><div className="stat-value">{issues.length}</div><div className="stat-meta">in the your ward register</div></div>
           <div className="stat-card"><div className="stat-label">Issues backed</div><div className="stat-value">{backedIssues.length}</div><div className="stat-meta">reports you support</div></div>
           <div className="stat-card"><div className="stat-label">Receiving action</div><div className="stat-value">{issues.filter((issue) => issue.status === "in_progress").length}</div><div className="stat-meta">currently in progress</div></div>
           <div className="stat-card"><div className="stat-label">Resolved</div><div className="stat-value band-amber">{issues.filter((issue) => issue.status === "resolved").length}</div><div className="stat-meta">closed by ward office</div></div>
@@ -758,7 +939,7 @@ function AdminPage() {
   return (
     <AppShell title="Ward office" eyebrow="Triage console">
       <div className="page">
-        <PageHeader eyebrow="Ward 154 · Shivajinagar" title="Turn reports into action." description="Triage the resident register by priority, then leave a clear status trail for the people who raised it." action={<button className="button button-secondary" onClick={refresh} data-testid="button-refresh-admin"><Activity size={15} />Refresh register</button>} />
+        <PageHeader eyebrow="Civic register" title="Turn reports into action." description="Triage the resident register by priority, then leave a clear status trail for the people who raised it." action={<button className="button button-secondary" onClick={refresh} data-testid="button-refresh-admin"><Activity size={15} />Refresh register</button>} />
         <div className="stat-grid">
           <div className="stat-card featured"><div className="stat-label">Open workload</div><div className="stat-value">{issues.filter((issue) => issue.status !== "resolved").length}</div><div className="stat-meta">reports needing ward attention</div></div>
           <div className="stat-card"><div className="stat-label">Pending review</div><div className="stat-value">{issues.filter((issue) => issue.status === "pending").length}</div><div className="stat-meta">new resident entries</div></div>
@@ -766,7 +947,11 @@ function AdminPage() {
           <div className="stat-card"><div className="stat-label">Closed</div><div className="stat-value band-amber">{issues.filter((issue) => issue.status === "resolved").length}</div><div className="stat-meta">marked resolved</div></div>
         </div>
         <div className="admin-grid">
-          <section className="panel"><div className="panel-header"><div><h2>Priority triage</h2><p>Change a status to publish an accountable update.</p></div><span className="eyebrow">{filteredIssues.length} of {issues.length} records</span></div><div className="admin-filters"><div className="admin-search"><Search size={14} /><input value={adminSearch} onChange={(event) => setAdminSearch(event.target.value)} placeholder="Search ID, reporter or place" data-testid="input-admin-search" /></div><select className="filter-select" value={adminCategory} onChange={(event) => setAdminCategory(event.target.value)} data-testid="select-admin-category"><option value="all">All categories</option>{Object.entries(CATEGORY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><select className="filter-select" value={adminStatus} onChange={(event) => setAdminStatus(event.target.value)} data-testid="select-admin-status"><option value="all">All statuses</option>{Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>{isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filteredIssues.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>Photo</th><th>Issue</th><th>Priority</th><th>Filed</th><th>Route</th><th>Status workflow</th></tr></thead><tbody>{filteredIssues.map((issue) => <tr key={issue.id}><td>{issue.photo_url ? <img className="photo-thumb" src={issue.photo_url} alt={`Evidence for ${issue.id}`} data-testid={`photo-thumb-${issue.id}`} /> : <div className="photo-thumb photo-thumb-empty" data-testid={`photo-thumb-empty-${issue.id}`}><CloudUpload size={14} /></div>}</td><td><div className="table-title">{CATEGORY_LABELS[issue.category]}</div><div className="table-sub">{issue.id} · {locationLabel(issue)}</div></td><td><Score score={issue.priority_score} /></td><td><div className="table-sub">{formatDate(issue.created_at)}</div><div className="table-sub">{issue.reporter}</div></td><td><button type="button" className="quiet-button" onClick={() => setRouting(issue)} data-testid={`button-route-${issue.id}`}><Navigation size={13} />Directions</button></td><td><select className="filter-select status-select" value={issue.status} onChange={(event) => handleStatus(issue.id, event.target.value)} data-testid={`select-status-${issue.id}`}><option value="pending">Pending review</option><option value="in_progress">In progress</option><option value="resolved">Resolved</option></select></td></tr>)}</tbody></table></div> : <div className="empty-state" data-testid="state-empty-admin"><Search size={26} /><strong>No matching register entries</strong><p>Adjust the search or filters to widen the triage view.</p></div>}</section>
+          <section className="panel"><div className="panel-header"><div><h2>Priority triage</h2><p>Change a status to publish an accountable update.</p></div><span className="eyebrow">{filteredIssues.length} of {issues.length} records</span></div><div className="admin-filters"><div className="admin-search"><Search size={14} /><input value={adminSearch} onChange={(event) => setAdminSearch(event.target.value)} placeholder="Search ID, reporter or place" data-testid="input-admin-search" /></div><select className="filter-select" value={adminCategory} onChange={(event) => setAdminCategory(event.target.value)} data-testid="select-admin-category"><option value="all">All categories</option>{Object.entries(CATEGORY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><select className="filter-select" value={adminStatus} onChange={(event) => setAdminStatus(event.target.value)} data-testid="select-admin-status"><option value="all">All statuses</option>{Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>{isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filteredIssues.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>Photo</th><th>Issue</th><th>Priority</th><th>Filed</th><th>Evidence</th><th>Verified</th><th>Route</th><th>Status workflow</th></tr></thead><tbody>{filteredIssues.map((issue) => <tr key={issue.id}><td>{issue.photo_url ? (issue.media_type === "video" ? <video className="photo-thumb" src={issue.photo_url} muted data-testid={`video-thumb-${issue.id}`} /> : <img className="photo-thumb" src={issue.photo_url} alt={`Evidence for ${issue.id}`} data-testid={`photo-thumb-${issue.id}`} />) : <div className="photo-thumb photo-thumb-empty" data-testid={`photo-thumb-empty-${issue.id}`}><CloudUpload size={14} /></div>}</td><td><div className="table-title">{CATEGORY_LABELS[issue.category]}</div><div className="table-sub">{issue.id} · {locationLabel(issue)}</div></td><td><Score score={issue.priority_score} /></td><td><div className="table-sub">{formatDate(issue.created_at)}</div><div className="table-sub">{issue.reporter}</div></td><td>{issue.geo_source === "exif" && <div className="prov-tag prov-good" data-testid={`prov-exif-${issue.id}`}>photo GPS</div>}{issue.land_class === "private" && <div className="prov-tag prov-bad">private land</div>}{issue.land_class === "public" && <div className="prov-tag prov-good">public land</div>}{issue.video_url && <div className="prov-tag">video</div>}</td><td>{(() => { const c = Number(issue.confirmations || 0), d = Number(issue.disputes || 0), t = c + d;
+  if (!t) return <span className="table-sub">not checked yet</span>;
+  const pct = Math.round((c / t) * 100);
+  return <div className={`trust-inline ${pct >= 60 ? "trust-good" : pct >= 40 ? "trust-mixed" : "trust-poor"}`} data-testid={`trust-cell-${issue.id}`}><strong>{pct}%</strong><span>{c} yes · {d} no</span></div>;
+})()}</td><td><button type="button" className="quiet-button" onClick={() => setRouting(issue)} data-testid={`button-route-${issue.id}`}><Navigation size={13} />Directions</button></td><td><select className="filter-select status-select" value={issue.status} onChange={(event) => handleStatus(issue.id, event.target.value)} data-testid={`select-status-${issue.id}`}><option value="pending">Pending review</option><option value="in_progress">In progress</option><option value="resolved">Resolved</option></select></td></tr>)}</tbody></table></div> : <div className="empty-state" data-testid="state-empty-admin"><Search size={26} /><strong>No matching register entries</strong><p>Adjust the search or filters to widen the triage view.</p></div>}</section>
           <aside className="panel"><div className="panel-header"><div><h2>Register shape</h2><p>Reports by category</p></div><SlidersHorizontal size={16} color="var(--muted)" /></div><div className="bar-list">{counts.map(({ category, count }) => <div className="bar-item" key={category}><span>{CATEGORY_LABELS[category]}</span><div className="bar-track"><div className="bar-fill" style={{ width: `${(count / maxCount) * 100}%` }} /></div><strong>{count}</strong></div>)}</div><div className="panel-body" style={{ borderTop: "1px solid var(--line)" }}><div className="eyebrow">Service signal</div><div className="metric-list"><div className="metric-row"><span>Average priority</span><strong>{issues.length ? Math.round(issues.reduce((sum, issue) => sum + issue.priority_score, 0) / issues.length) : 0}</strong></div><div className="metric-row"><span>Resident backing</span><strong>{issues.reduce((sum, issue) => sum + issue.upvotes, 0)}</strong></div><div className="metric-row"><span>Resolution rate</span><strong>{issues.length ? `${Math.round((issues.filter((issue) => issue.status === "resolved").length / issues.length) * 100)}%` : "0%"}</strong></div></div></div></aside>
         </div>
       </div>
@@ -779,6 +964,49 @@ function AdminPage() {
         />
       )}
     </AppShell>
+  );
+}
+
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+
+/* Google renders this button itself, from a script we load once. Without a client
+   id configured the whole thing is skipped, so nothing breaks on a fresh clone. */
+function GoogleButton({ onCredential, onError }) {
+  const holder = useRef(null);
+
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID || !holder.current) return undefined;
+    let cancelled = false;
+
+    const render = () => {
+      if (cancelled || !window.google?.accounts?.id) return;
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: (response) => onCredential(response.credential)
+      });
+      window.google.accounts.id.renderButton(holder.current, {
+        theme: "outline", size: "large", width: 320, text: "continue_with", shape: "rectangular"
+      });
+    };
+
+    if (window.google?.accounts?.id) { render(); return undefined; }
+
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = render;
+    script.onerror = () => onError?.("Google sign-in could not load. Use an email and password.");
+    document.head.appendChild(script);
+    return () => { cancelled = true; };
+  }, []);
+
+  if (!GOOGLE_CLIENT_ID) return null;
+  return (
+    <div className="google-block">
+      <div ref={holder} className="google-button" data-testid="button-google-signin" />
+      <div className="auth-divider"><span>or use an email address</span></div>
+    </div>
   );
 }
 
@@ -807,8 +1035,17 @@ function AuthPage() {
   };
   return (
     <div className="auth-page">
-      <section className="auth-aside"><Logo /><div className="auth-kicker">Public infrastructure, made legible</div><h1>Small reports.<br /><em>Visible action.</em></h1><p className="subhead">CivicFix connects a resident’s street view to the ward office responsible for fixing it.</p><div className="auth-footer">Built for residents of Ward 154, Shivajinagar · Bengaluru</div></section>
-      <section className="auth-form-side"><div className="auth-card"><div className="eyebrow">Resident access</div><h2>{mode === "signin" ? "Welcome back." : "Join the ward register."}</h2><p className="subhead">{mode === "signin" ? "Sign in to follow reports and back the issues your street needs fixed." : "Create a local account to file reports and keep a visible record of action."}</p><div className="auth-tabs"><button className={`auth-tab ${mode === "signin" ? "active" : ""}`} onClick={() => { setMode("signin"); setError(""); }} data-testid="button-auth-signin">Sign in</button><button className={`auth-tab ${mode === "register" ? "active" : ""}`} onClick={() => { setMode("register"); setError(""); }} data-testid="button-auth-register">Create account</button></div><form className="auth-form" onSubmit={submit}>{mode === "register" && <div className="field"><label htmlFor="auth-name">Full name</label><input id="auth-name" className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="Ananya Rao" data-testid="input-auth-name" /></div>}<div className="field"><label htmlFor="auth-email">Email address</label><input id="auth-email" className="input" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" data-testid="input-auth-email" /></div><div className="field"><label htmlFor="auth-password">Password</label><input id="auth-password" className="input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" data-testid="input-auth-password" /></div>{error && <div className="auth-note" role="alert" data-testid="status-auth-error">{error}</div>}<button type="submit" className="button button-primary" disabled={busy} data-testid="button-submit-auth">{busy ? "Opening your register…" : mode === "signin" ? "Sign in to CivicFix" : "Create resident account"}<ArrowRight size={15} /></button></form><p className="auth-legal">By continuing, you agree that reports are visible to other residents in your ward. This demo uses local mock data only; no account details leave this device.</p></div></section>
+      <section className="auth-aside"><Logo /><div className="auth-kicker">Public infrastructure, made legible</div><h1>Small reports.<br /><em>Visible action.</em></h1><p className="subhead">CivicFix connects a resident’s street view to the ward office responsible for fixing it.</p><div className="auth-footer">A shared register of street-level issues</div></section>
+      <section className="auth-form-side"><div className="auth-card"><div className="eyebrow">Resident access</div>
+        <GoogleButton
+          onError={setError}
+          onCredential={async (credential) => {
+            setBusy(true); setError("");
+            try { await signInWithGoogle(credential); setLocation("/map"); }
+            catch (err) { setError(err.message || "Google sign-in failed."); }
+            finally { setBusy(false); }
+          }}
+        /><h2>{mode === "signin" ? "Welcome back." : "Join the ward register."}</h2><p className="subhead">{mode === "signin" ? "Sign in to follow reports and back the issues your street needs fixed." : "Create a local account to file reports and keep a visible record of action."}</p><div className="auth-tabs"><button className={`auth-tab ${mode === "signin" ? "active" : ""}`} onClick={() => { setMode("signin"); setError(""); }} data-testid="button-auth-signin">Sign in</button><button className={`auth-tab ${mode === "register" ? "active" : ""}`} onClick={() => { setMode("register"); setError(""); }} data-testid="button-auth-register">Create account</button></div><form className="auth-form" onSubmit={submit}>{mode === "register" && <div className="field"><label htmlFor="auth-name">Full name</label><input id="auth-name" className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="Ananya Rao" data-testid="input-auth-name" /></div>}<div className="field"><label htmlFor="auth-email">Email address</label><input id="auth-email" className="input" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" data-testid="input-auth-email" /></div><div className="field"><label htmlFor="auth-password">Password</label><input id="auth-password" className="input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" data-testid="input-auth-password" /></div>{error && <div className="auth-note" role="alert" data-testid="status-auth-error">{error}</div>}<button type="submit" className="button button-primary" disabled={busy} data-testid="button-submit-auth">{busy ? "Opening your register…" : mode === "signin" ? "Sign in to CivicFix" : "Create resident account"}<ArrowRight size={15} /></button></form><p className="auth-legal">By continuing, you agree that reports are visible to other residents in your ward. This demo uses local mock data only; no account details leave this device.</p></div></section>
     </div>
   );
 }

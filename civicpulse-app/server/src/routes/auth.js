@@ -3,10 +3,17 @@ import bcrypt from 'bcryptjs';
 import { q } from '../db.js';
 import { sign, requireAuth, requireAdmin } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rateLimit.js';
+import { OAuth2Client } from 'google-auth-library';
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@city.gov').toLowerCase();
 
 const r = Router();
 const shape = (u) => ({
   id: u.id, name: u.name, email: u.email, role: u.role, created_at: u.created_at,
+  avatar_url: u.avatar_url || null,
+  auth_provider: u.auth_provider || 'password',
   office: u.office_lat != null && u.office_lng != null
     ? { latitude: u.office_lat, longitude: u.office_lng, label: u.office_label || 'Ward office' }
     : null
@@ -34,6 +41,9 @@ r.post('/login', authLimiter, async (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase();
   const { rows } = await q('SELECT * FROM users WHERE email = $1', [email]);
   const user = rows[0];
+  if (user && !user.password_hash) {
+    return res.status(401).json({ error: 'This account signs in with Google. Use the Google button instead.' });
+  }
   const ok = user && (await bcrypt.compare(req.body.password || '', user.password_hash));
   if (!ok) return res.status(401).json({ error: 'Email or password is wrong.' });
   res.json({ token: sign(user), user: shape(user) });
@@ -58,6 +68,57 @@ r.patch('/me', requireAuth, async (req, res) => {
   if (!name) return res.status(400).json({ error: 'Name cannot be empty.' });
   const { rows } = await q('UPDATE users SET name = $1 WHERE id = $2 RETURNING *', [name, req.user.id]);
   res.json({ user: shape(rows[0]) });
+});
+
+/* Google sign-in.
+   The browser sends the ID token Google issued it; we verify that token against
+   Google's keys rather than trusting anything the page tells us. A Google account
+   always maps to a resident — the ward office signs in with a password, so an
+   administrator can never be created by anyone who happens to own an address. */
+r.post('/google', authLimiter, async (req, res) => {
+  if (!googleClient) {
+    return res.status(503).json({ error: 'Google sign-in is not configured on this server.' });
+  }
+  const credential = req.body.credential;
+  if (!credential) return res.status(400).json({ error: 'No Google credential was sent.' });
+
+  let payload;
+  try {
+    const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
+    payload = ticket.getPayload();
+  } catch {
+    return res.status(401).json({ error: 'That Google sign-in could not be verified.' });
+  }
+
+  const email = (payload.email || '').toLowerCase();
+  if (!email || payload.email_verified === false) {
+    return res.status(401).json({ error: 'Google did not confirm that email address.' });
+  }
+  if (email === ADMIN_EMAIL) {
+    return res.status(403).json({ error: 'The ward office account signs in with its password, not Google.' });
+  }
+
+  const existing = await q('SELECT * FROM users WHERE google_sub = $1 OR email = $2', [payload.sub, email]);
+  let user = existing.rows[0];
+
+  if (user) {
+    const updated = await q(
+      `UPDATE users SET google_sub = $1, avatar_url = COALESCE($2, avatar_url),
+                        auth_provider = CASE WHEN password_hash IS NULL THEN 'google' ELSE auth_provider END
+       WHERE id = $3 RETURNING *`,
+      [payload.sub, payload.picture || null, user.id]
+    );
+    user = updated.rows[0];
+  } else {
+    const created = await q(
+      `INSERT INTO users (name, email, google_sub, avatar_url, auth_provider, role)
+       VALUES ($1,$2,$3,$4,'google','user') RETURNING *`,
+      [payload.name || email.split('@')[0], email, payload.sub, payload.picture || null]
+    );
+    user = created.rows[0];
+  }
+
+  res.json({ token: sign(user), user: shape(user) });
 });
 
 /* where the crew starts from — admin only */

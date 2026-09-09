@@ -43,6 +43,64 @@ CREATE TABLE IF NOT EXISTS status_history (
   changed_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- photo or video, and whether the file carried its own GPS tag
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS media_type    text NOT NULL DEFAULT 'photo'
+  CHECK (media_type IN ('photo','video','none'));
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS geo_source    text NOT NULL DEFAULT 'device'
+  CHECK (geo_source IN ('exif','device','manual'));
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS exif_lat      double precision;
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS exif_lng      double precision;
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS exif_drift_m  double precision;
+
+-- federated sign-in: a Google account has no password of ours to store
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub text UNIQUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider text NOT NULL DEFAULT 'password'
+  CHECK (auth_provider IN ('password','google'));
+
+-- a report carries both a geotagged still and a clip
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS video_url text;
+
+-- GIS land-use classification for the reported point
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS land_class text NOT NULL DEFAULT 'unknown'
+  CHECK (land_class IN ('public','private','unknown'));
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS land_note  text;
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS device_lat double precision;
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS device_lng double precision;
+
+-- community verification: residents confirm or dispute that the issue is really there
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS confirmations integer NOT NULL DEFAULT 0;
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS disputes      integer NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS issue_verifications (
+  issue_id   integer NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  user_id    integer NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
+  verdict    text    NOT NULL CHECK (verdict IN ('confirm','dispute')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (issue_id, user_id)     -- one verdict per person per issue
+);
+
+CREATE INDEX IF NOT EXISTS idx_verifications_issue ON issue_verifications (issue_id);
+
+-- keep both counters in step with the verification table
+CREATE OR REPLACE FUNCTION sync_verification_counts() RETURNS trigger AS $$
+DECLARE target integer;
+BEGIN
+  IF TG_OP = 'DELETE' THEN target := OLD.issue_id; ELSE target := NEW.issue_id; END IF;
+  UPDATE issues SET
+    confirmations = (SELECT count(*) FROM issue_verifications WHERE issue_id = target AND verdict = 'confirm'),
+    disputes      = (SELECT count(*) FROM issue_verifications WHERE issue_id = target AND verdict = 'dispute')
+  WHERE id = target;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_verifications ON issue_verifications;
+CREATE TRIGGER trg_sync_verifications
+AFTER INSERT OR UPDATE OR DELETE ON issue_verifications
+FOR EACH ROW EXECUTE FUNCTION sync_verification_counts();
+
 -- an admin's depot or ward office, used as the starting point for directions
 ALTER TABLE users ADD COLUMN IF NOT EXISTS office_lat   double precision;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS office_lng   double precision;

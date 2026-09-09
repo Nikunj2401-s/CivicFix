@@ -51,6 +51,11 @@ export async function getIssues(filters = {}) {
   );
 }
 
+/** Ask whether a coordinate is public space before uploading anything. */
+export async function checkLand(latitude, longitude) {
+  return request('/issues/check-land', { method: 'POST', body: { latitude, longitude } });
+}
+
 export async function getIssue(id) {
   return request(`/issues/${id}`);
 }
@@ -67,14 +72,25 @@ export async function createIssue(input) {
   form.append('latitude', String(input.latitude));
   form.append('longitude', String(input.longitude));
   form.append('confirm', 'true');            // the UI already ran its own nearby check
+  if (input.pinned_by_hand) form.append('pinned_by_hand', 'true');
+  if (input.device_lat != null) form.append('device_lat', String(input.device_lat));
+  if (input.device_lng != null) form.append('device_lng', String(input.device_lng));
 
-  if (input.photo_url?.startsWith('data:')) {
-    const blob = await (await fetch(input.photo_url)).blob();
-    const ext = (blob.type.split('/')[1] || 'jpg').replace('jpeg', 'jpg');
-    form.append('photo', blob, `report.${ext}`);
-  }
+  /* The original files go up untouched — re-encoding a photo would strip the very
+     EXIF GPS tag the server checks. */
+  if (input.photo_file) form.append('photo', input.photo_file, input.photo_file.name || 'photo.jpg');
+  if (input.video_file) form.append('video', input.video_file, input.video_file.name || 'clip.mp4');
 
   return request('/issues', { method: 'POST', form });
+}
+
+/** Confirm or dispute that the issue is really there. One verdict per person. */
+export async function verifyIssue(id, verdict) {
+  return request(`/issues/${id}/verify`, { method: 'POST', body: { verdict } });
+}
+
+export async function withdrawVerification(id) {
+  return request(`/issues/${id}/verify`, { method: 'DELETE' });
 }
 
 export async function upvoteIssue(id) {
@@ -107,6 +123,13 @@ export async function getCurrentUser() {
 
 export async function signIn({ email, password }) {
   const { token, user } = await request('/auth/login', { method: 'POST', body: { email, password } });
+  setToken(token);
+  return user;
+}
+
+/** Hands Google's ID token to our server, which verifies it against Google's keys. */
+export async function signInWithGoogle(credential) {
+  const { token, user } = await request('/auth/google', { method: 'POST', body: { credential } });
   setToken(token);
   return user;
 }
