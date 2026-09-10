@@ -4,14 +4,14 @@ import L from "leaflet";
 import exifr from "exifr";
 import "leaflet/dist/leaflet.css";
 import {
-  Activity, AlertTriangle, ArrowDownUp, ArrowRight, Bell, Check, CheckCircle2, CircleHelp, ClipboardList,
-  CloudUpload, FilePlus2, Filter, Flag, Gauge, Lightbulb, ListFilter, LocateFixed,
-  LockKeyhole, Map as MapIcon, Menu, Navigation, Plus, Search, ShieldCheck,
-  SlidersHorizontal, ThumbsUp, X,
+  Activity, AlertTriangle, ArrowLeft, ArrowRight, ArrowUpRight, Camera, Check, CheckCircle2,
+  CircleHelp, ClipboardList, CloudUpload, FileText, Filter, Flag, Globe2, ImagePlus, Lightbulb,
+  LocateFixed, LockKeyhole, Menu, Navigation, Plus, Search, ShieldCheck, Siren, SlidersHorizontal,
+  ThumbsUp, Video, X,
 } from "lucide-react";
 import {
   backIssue, checkLand, createIssue, verifyIssue, signInWithGoogle, getPolicy, findNearbyIssues, getCurrentUser, getIssues, getMyReports,
-  distanceInMeters, register, signIn, updateIssueStatus, upvoteIssue, isAuthed, signOut,
+  distanceInMeters, register, signIn, updateIssueStatus, upvoteIssue, isAuthed, signOut, getReportQuota,
 } from "./lib/api";
 
 const CATEGORY_LABELS = {
@@ -28,7 +28,25 @@ const CATEGORY_ICONS = {
   broken_streetlight: Lightbulb,
   road_damage: Navigation,
 };
+const CATEGORY_DESK = {
+  pothole: "Roads maintenance squad",
+  garbage: "Sanitation squad",
+  water_leakage: "Water board crew",
+  broken_streetlight: "Street lighting crew",
+  road_damage: "Roads maintenance squad",
+};
 const STATUS_LABELS = { pending: "Pending review", in_progress: "In progress", resolved: "Resolved" };
+const SEVERITY_SCALE = [
+  [5, "Critical danger or obstruction", "An immediate hazard to life, or a main route is blocked."],
+  [4, "High impact safety risk", "Likely property damage, or a main artery is breaking down."],
+  [3, "Moderate civic disruption", "A persistent inconvenience or sanitation hazard."],
+  [2, "Minor street defect", "Localised chipping or overflow. Not hazardous."],
+  [1, "Cosmetic or low urgency", "An aesthetic defect, or routine scheduled maintenance."],
+];
+const DESCRIPTION_CUES = [
+  "near the junction", "pedestrian hazard", "waterlogs in the monsoon",
+  "unlit after dark", "beside a school gate",
+];
 
 /* One place that watches the device position, so every map can show "you are here". */
 function useMyPosition(watch = true) {
@@ -160,10 +178,11 @@ function useMapAutosize(mapRef, hostRef) {
   }, []);
 }
 
-function scoreBand(score) {
-  if (score >= 65) return "red";
-  if (score >= 40) return "amber";
-  return "grey";
+/* red above 65, amber from 40, grey below — unchanged thresholds, new class names */
+function scoreTone(score) {
+  if (score >= 65) return "high";
+  if (score >= 40) return "medium";
+  return "low";
 }
 
 function formatDate(date) {
@@ -173,6 +192,12 @@ function formatDate(date) {
 function formatShortDate(date) {
   return new Intl.DateTimeFormat("en-IN", { day: "numeric", month: "short" }).format(new Date(date));
 }
+
+function formatDateTime(date) {
+  return new Intl.DateTimeFormat("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(date));
+}
+
+const issueRef = (issue) => `#${issue.id}`;
 
 function locationLabel(issue) {
   const locations = {
@@ -184,7 +209,7 @@ function locationLabel(issue) {
     "CF-1028": "Market Street entrance",
     "CF-1021": "4th Cross, ward park",
   };
-  return locations[issue.id] || `${issue.latitude.toFixed(4)}, ${issue.longitude.toFixed(4)}`;
+  return locations[issue.id] || `${Number(issue.latitude).toFixed(4)}, ${Number(issue.longitude).toFixed(4)}`;
 }
 
 function useToast() {
@@ -195,6 +220,18 @@ function useToast() {
     return () => window.clearTimeout(timeout);
   }, [toast]);
   return [toast, setToast];
+}
+
+/* The signed-in account, fetched once and shared. Several screens need to know
+   whose reports are whose, because a person may not back or verify their own. */
+let mePromise = null;
+function useMe() {
+  const [me, setMe] = useState({ name: "", id: null, role: null });
+  useEffect(() => {
+    if (!mePromise) mePromise = getCurrentUser();
+    mePromise.then(setMe).catch(() => { mePromise = null; });
+  }, []);
+  return me;
 }
 
 function useIssueFeed(myOnly = false) {
@@ -216,147 +253,306 @@ function useIssueFeed(myOnly = false) {
   return { issues, isLoading, error, refresh };
 }
 
-function Logo() {
+/* ------------------------------------------------------------------ shell */
+
+function Brand({ tagline = "Municipal issue priority system" }) {
   return (
     <div className="brand" data-testid="brand-civicfix">
       <div className="brand-mark">C</div>
-      <div className="brand-name">CivicFix<small>WARD ACTION REGISTER</small></div>
+      <div>
+        <strong>CivicFix <small>OFFICIAL</small></strong>
+        <span>{tagline}</span>
+      </div>
     </div>
   );
 }
 
-function NavItem({ href, icon: Icon, label, current }) {
-  return (
-    <Link href={href} className={`nav-link ${current === href ? "active" : ""}`} data-testid={`link-${label.toLowerCase().replaceAll(" ", "-")}`}>
-      <Icon aria-hidden="true" /><span>{label}</span>
-    </Link>
-  );
-}
+const NAV_ITEMS = [
+  { href: "/map", label: "Map & priority queue", icon: Globe2 },
+  { href: "/my-reports", label: "My reports", icon: FileText },
+  { href: "/admin", label: "Ward priority desk", icon: SlidersHorizontal, adminOnly: true },
+];
 
-function AppShell({ children, title, eyebrow = "Resident workspace" }) {
+function AppShell({ children }) {
   const [location] = useLocation();
-  const [user, setUser] = useState({ name: "", ward: "" });
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  useEffect(() => { getCurrentUser().then(setUser).catch(() => {}); }, []);
+  const user = useMe();
+  const [navOpen, setNavOpen] = useState(false);
+  useEffect(() => { setNavOpen(false); }, [location]);
 
-  /* the drawer should never survive a navigation, and Escape should always close it */
-  useEffect(() => { setDrawerOpen(false); }, [location]);
-  useEffect(() => {
-    if (!drawerOpen) return undefined;
-    const onKey = (event) => { if (event.key === "Escape") setDrawerOpen(false); };
-    window.addEventListener("keydown", onKey);
-    document.body.style.overflow = "hidden";
-    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = ""; };
-  }, [drawerOpen]);
+  const initials = (user.name || "·").split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+  const items = NAV_ITEMS.filter((item) => !item.adminOnly || user.role === "admin");
+
   return (
-    <div className="app-shell">
-      {drawerOpen && <div className="drawer-scrim" onClick={() => setDrawerOpen(false)} data-testid="drawer-scrim" />}
-      <aside className={`sidebar${drawerOpen ? " sidebar-open" : ""}`}>
-        <button className="drawer-close" onClick={() => setDrawerOpen(false)} aria-label="Close navigation" data-testid="button-close-navigation"><X size={16} /></button>
-        <Logo />
-        <div className="nav-label">Civic register</div>
-        <nav className="nav-list" aria-label="Primary navigation">
-          <NavItem href="/map" icon={MapIcon} label="Issue map" current={location} />
-          <NavItem href="/report" icon={FilePlus2} label="Report issue" current={location} />
-          <NavItem href="/my-reports" icon={ClipboardList} label="My reports" current={location} />
-          {user.role === "admin" && <NavItem href="/admin" icon={Gauge} label="Ward office" current={location} />}
-          <NavItem href="/sign-out" icon={LockKeyhole} label="Sign out" current={location} />
-        </nav>
-        <div className="sidebar-spacer" />
-        <div className="ward-card" data-testid="card-active-ward">
-          <div className="eyebrow">Active ward</div>
-          <strong>{user.ward || "Civic register"}</strong>
-          <span>Live data · PostgreSQL</span>
-        </div>
-        <div className="profile-strip" data-testid="profile-current-user">
-          <div className="avatar">{(user.name || "·").split(" ").map((part) => part[0]).join("").slice(0, 2)}</div>
-          <div><strong>{user.name || "Signed in"}</strong><span>{user.role === "admin" ? "Ward administrator" : "Resident account"}</span></div>
-        </div>
-      </aside>
-      <main className="main-column">
-        <header className="topbar">
-          <div style={{ display: "flex", alignItems: "center" }}>
-            <button className="icon-button mobile-menu" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-expanded={drawerOpen} data-testid="button-open-navigation"><Menu size={17} /></button>
-            <div><div className="topbar-kicker">{eyebrow}</div><div className="topbar-title">{title}</div></div>
-          </div>
-          <div className="topbar-actions">
-            <button className="icon-button" aria-label="View alerts" onClick={() => {}} data-testid="button-view-alerts"><Bell size={16} /></button>
-            <Link href="/report" className="quiet-button" data-testid="link-quick-report"><Plus size={15} /><span>New report</span></Link>
+    <div className="app-shell civic-home-shell">
+      <div className="main-shell">
+        <header className="civic-topbar">
+          <Brand />
+          <button className="menu-button" onClick={() => setNavOpen(!navOpen)} aria-label="Open navigation" aria-expanded={navOpen} data-testid="button-open-navigation">
+            <Menu size={20} />
+          </button>
+          <nav className={`top-nav${navOpen ? " open" : ""}`} aria-label="Primary navigation">
+            {items.map(({ href, label, icon: Icon }) => (
+              <Link
+                key={href}
+                href={href}
+                className={`top-nav-item${location === href ? " active" : ""}`}
+                data-testid={`link-${label.toLowerCase().replaceAll(" ", "-").replaceAll("&", "and")}`}
+              >
+                <Icon size={16} /><span>{label}</span>
+              </Link>
+            ))}
+            <Link href="/report" className="top-nav-item report-nav" data-testid="link-quick-report">
+              <Plus size={16} /><span>Report issue</span>
+            </Link>
+          </nav>
+          <div className="top-user" data-testid="profile-current-user">
+            <span className="top-avatar">{initials}</span>
+            <span>
+              <strong>{user.name || "Signed in"}</strong>
+              <small>{user.role === "admin" ? "Ward administrator" : "Resident account"}</small>
+            </span>
+            <Link href="/sign-out" className="top-signout" aria-label="Sign out" data-testid="link-sign-out">
+              <LockKeyhole size={16} />
+            </Link>
           </div>
         </header>
         {children}
-      </main>
+      </div>
     </div>
   );
 }
 
-function PageHeader({ eyebrow, title, description, action }) {
+/* ------------------------------------------------------- small components */
+
+function Badge({ children, tone = "neutral" }) {
+  return <span className={`badge ${tone}`} data-testid={`badge-${tone}`}>{children}</span>;
+}
+
+function StatusBadge({ status }) {
+  return <span className={`badge ${status}`} data-testid={`status-${status}`}>{STATUS_LABELS[status]}</span>;
+}
+
+function Score({ score, small = false }) {
   return (
-    <div className="page-header">
-      <div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1>{description && <p className="subhead">{description}</p>}</div>
-      {action}
+    <div className={`priority ${scoreTone(score)}${small ? " small" : ""}`} data-testid={`score-${score}`}>
+      <strong>{score}</strong><span>priority</span>
     </div>
   );
 }
 
-function Score({ score, large = false }) {
-  const band = scoreBand(score);
-  return <div className={`score-badge band-${band}`} style={large ? { fontSize: 40 } : undefined} data-testid={`score-${score}`}><span>{score}</span><small>priority</small></div>;
-}
-
-function StatusChip({ status }) {
-  return <span className={`status-chip status-${status}`} data-testid={`status-${status}`}>{STATUS_LABELS[status]}</span>;
+function ScoreTag({ score }) {
+  return (
+    <div className={`score-tag ${scoreTone(score)}`} data-testid={`score-tag-${score}`}>
+      {score}<small>SCORE</small>
+    </div>
+  );
 }
 
 function LoadingPanel({ rows = 4 }) {
-  return <div className="loading-stack" data-testid="state-loading">{Array.from({ length: rows }).map((_, index) => <div className="skeleton" key={index} style={{ height: index === 0 ? 42 : 58, width: `${96 - index * 7}%` }} />)}</div>;
-}
-
-function ErrorPanel({ onRetry }) {
-  return <div className="error-state" data-testid="state-error"><AlertTriangle size={24} /><strong>Register unavailable</strong><span>Something interrupted the local register.</span><button className="button button-secondary" onClick={onRetry} data-testid="button-retry">Try again</button></div>;
-}
-
-function IssueQueueCard({ issue, onSelect }) {
-  const Icon = CATEGORY_ICONS[issue.category] || Flag;
   return (
-    <button className={`queue-card standing-${communityStanding(issue).key}`} onClick={() => onSelect(issue)} data-testid={`card-issue-${issue.id}`}>
-      <div className={`queue-stripe band-${scoreBand(issue.priority_score)}`} style={{ background: "currentColor" }} />
-      <div>
-        <div className="queue-title">
-          <Icon size={13} style={{ verticalAlign: "-2px", marginRight: 5 }} />{CATEGORY_LABELS[issue.category]}
-          {communityStanding(issue).key === "verified" && (
-            <span className="verified-chip" data-testid={`chip-verified-${issue.id}`}><ShieldCheck size={11} />Verified</span>
-          )}
-          {communityStanding(issue).key === "disputed" && (
-            <span className="disputed-chip" data-testid={`chip-disputed-${issue.id}`}><AlertTriangle size={11} />Disputed</span>
-          )}
-        </div>
-        <div className="queue-location">{locationLabel(issue)}</div>
-        <div className="queue-meta"><StatusChip status={issue.status} /><span>{issue.upvotes} backing{issue.upvotes === 1 ? "" : "s"}</span></div>
-      </div>
-      <Score score={issue.priority_score} />
-    </button>
-  );
-}
-
-function StatusTimeline({ status }) {
-  const steps = [
-    ["pending", "Pending review", "Reported and visible to the ward register."],
-    ["in_progress", "In progress", "The ward office has acknowledged the work."],
-    ["resolved", "Resolved", "The issue has been marked fixed."],
-  ];
-  const currentIndex = steps.findIndex(([value]) => value === status);
-  return (
-    <div className="status-timeline" data-testid="timeline-issue-status">
-      {steps.map(([value, label, description], index) => (
-        <div className={`timeline-step ${index <= currentIndex ? "complete" : ""} ${value === status ? "current" : ""}`} key={value}>
-          <div className="timeline-node">{index < currentIndex ? <Check size={11} /> : index + 1}</div>
-          <div><strong>{label}</strong><p>{description}</p></div>
-        </div>
+    <div className="loading-stack" data-testid="state-loading">
+      {Array.from({ length: rows }).map((_, index) => (
+        <div className="skeleton" key={index} style={{ height: index === 0 ? 42 : 58, width: `${96 - index * 7}%` }} />
       ))}
     </div>
   );
 }
+
+function ErrorPanel({ onRetry }) {
+  return (
+    <div className="error-state" data-testid="state-error">
+      <AlertTriangle size={24} />
+      <strong>Register unavailable</strong>
+      <span>Something interrupted the local register.</span>
+      <button className="button secondary" onClick={onRetry} data-testid="button-retry">Try again</button>
+    </div>
+  );
+}
+
+function Thumb({ issue, className = "" }) {
+  if (!issue.photo_url) {
+    return <div className={`thumb-empty ${className}`} data-testid={`photo-thumb-empty-${issue.id}`}><CloudUpload size={14} /></div>;
+  }
+  if (issue.media_type === "video") {
+    return <video className={className} src={issue.photo_url} muted data-testid={`video-thumb-${issue.id}`} />;
+  }
+  return <img className={className} src={issue.photo_url} alt={`Evidence for report ${issue.id}`} data-testid={`photo-thumb-${issue.id}`} />;
+}
+
+/* ------------------------------------------------------------ issue queue */
+
+function IssueRow({ issue, onSelect }) {
+  const standing = communityStanding(issue);
+  return (
+    <button className="issue-row" onClick={() => onSelect(issue)} data-testid={`card-issue-${issue.id}`}>
+      <ScoreTag score={issue.priority_score} />
+      <div className="issue-copy">
+        <div className="row-top">
+          <span>{issueRef(issue)}</span>
+          <Badge tone={issue.status}>{STATUS_LABELS[issue.status]}</Badge>
+        </div>
+        <strong>{issue.description}</strong>
+        <span className="issue-meta">
+          {CATEGORY_LABELS[issue.category]} · {issue.upvotes} backing{issue.upvotes === 1 ? "" : "s"} ·{" "}
+          <span className={standing.key === "disputed" ? "warn" : standing.key === "verified" ? "ok" : ""}>{standing.label}</span>
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function CategoryChips({ issues, value, onChange }) {
+  const options = [["all", "All"], ...Object.entries(CATEGORY_LABELS)];
+  return (
+    <div className="filter-row" role="group" aria-label="Filter by issue category">
+      {options.map(([category, label]) => (
+        <button
+          key={category}
+          className={`chip${value === category ? " selected" : ""}`}
+          onClick={() => onChange(category)}
+          data-testid={`button-filter-category-${category}`}
+        >
+          {label} <b>{category === "all" ? issues.length : issues.filter((issue) => issue.category === category).length}</b>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- the maps */
+
+function MapCanvas({ issues, onSelect }) {
+  const mapNode = useRef(null);
+  const mapRef = useRef(null);
+  useMapAutosize(mapRef, mapNode);
+  const markerLayerRef = useRef(null);
+  const youLayerRef = useRef(null);
+  const centredRef = useRef(false);
+  const { position, accuracy } = useMyPosition();
+  const onSelectRef = useRef(onSelect);
+  onSelectRef.current = onSelect;
+
+  useEffect(() => {
+    if (!mapNode.current || mapRef.current) return undefined;
+    const map = L.map(mapNode.current, { zoomControl: false, attributionControl: true }).setView([12.9719, 77.5945], 15);
+    L.control.zoom({ position: "bottomright" }).addTo(map);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 19 }).addTo(map);
+    markerLayerRef.current = L.layerGroup().addTo(map);
+    youLayerRef.current = L.layerGroup().addTo(map);
+    mapRef.current = map;
+    const sizeTimer = window.setTimeout(() => { if (mapRef.current === map) map.invalidateSize(); }, 100);
+    return () => { window.clearTimeout(sizeTimer); map.remove(); mapRef.current = null; };
+  }, []);
+
+  useEffect(() => {
+    if (!markerLayerRef.current) return;
+    markerLayerRef.current.clearLayers();
+    issues.forEach((issue) => {
+      const tone = scoreTone(issue.priority_score);
+      const marker = L.marker([issue.latitude, issue.longitude], {
+        icon: L.divIcon({
+          className: `map-pin ${tone}${issue.status === "resolved" ? " resolved" : ""}`,
+          html: `<span>${issue.priority_score}</span>`,
+          iconSize: [38, 38], iconAnchor: [19, 19]
+        })
+      });
+      marker.on("click", () => onSelectRef.current(issue));
+      marker.bindTooltip(`${CATEGORY_LABELS[issue.category]} · ${issue.priority_score}`, { direction: "top", offset: [0, -22] });
+      marker.addTo(markerLayerRef.current);
+    });
+  }, [issues]);
+
+  /* drop a "you are here" dot, and centre on it the first time it arrives */
+  useEffect(() => {
+    if (!youLayerRef.current || !position) return;
+    youLayerRef.current.clearLayers();
+    L.marker(position, { icon: youIcon(), zIndexOffset: 700 })
+      .bindTooltip("You are here").addTo(youLayerRef.current);
+    if (accuracy && accuracy > 60) {
+      L.circle(position, { radius: accuracy, color: "#397bb2", weight: 1, fillOpacity: .08, interactive: false })
+        .addTo(youLayerRef.current);
+    }
+    if (!centredRef.current) { mapRef.current?.setView(position, 15); centredRef.current = true; }
+  }, [position?.[0], position?.[1], accuracy]);
+
+  const recentre = () => { if (position) mapRef.current?.flyTo(position, 16, { duration: .6 }); };
+
+  return (
+    <div className="map-canvas">
+      <div ref={mapNode} className="leaflet-map" data-testid="map-issue-map" />
+      {position && (
+        <button type="button" className="recenter" onClick={recentre} title="Centre on my location" aria-label="Centre on my location" data-testid="button-recentre-map">
+          <LocateFixed size={17} />
+        </button>
+      )}
+      <div className="map-legend">
+        <strong>Priority colour scale</strong>
+        <span><i className="legend-dot high" />Urgent · 65 and above</span>
+        <span><i className="legend-dot medium" />Watch · 40 to 64</span>
+        <span><i className="legend-dot low" />Queued · under 40</span>
+      </div>
+    </div>
+  );
+}
+
+function ReportLocationMap({ latitude, longitude, onChange }) {
+  const youRef = useRef(null);
+  const { position: myPosition } = useMyPosition();
+  const mapNode = useRef(null);
+  const mapRef = useRef(null);
+  useMapAutosize(mapRef, mapNode);
+  const markerRef = useRef(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+
+  useEffect(() => {
+    if (!mapNode.current || mapRef.current) return undefined;
+    const initial = [Number(latitude) || 12.9719, Number(longitude) || 77.5945];
+    const map = L.map(mapNode.current, { zoomControl: true, attributionControl: true }).setView(initial, 16);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 19 }).addTo(map);
+    const marker = L.marker(initial, { draggable: true }).addTo(map);
+    marker.bindTooltip("Drag or click to place", { direction: "top", offset: [0, -20] }).openTooltip();
+    marker.on("dragend", () => {
+      const point = marker.getLatLng();
+      onChangeRef.current(point.lat, point.lng);
+    });
+    map.on("click", (event) => {
+      marker.setLatLng(event.latlng);
+      onChangeRef.current(event.latlng.lat, event.latlng.lng);
+    });
+    mapRef.current = map;
+    markerRef.current = marker;
+    const sizeTimer = window.setTimeout(() => { if (mapRef.current === map) map.invalidateSize(); }, 80);
+    return () => { window.clearTimeout(sizeTimer); map.remove(); mapRef.current = null; markerRef.current = null; };
+  }, []);
+
+  useEffect(() => {
+    if (!markerRef.current || !latitude || !longitude) return;
+    const point = [Number(latitude), Number(longitude)];
+    markerRef.current.setLatLng(point);
+    mapRef.current?.panTo(point, { animate: true, duration: .25 });
+  }, [latitude, longitude]);
+
+  useEffect(() => {
+    if (!mapRef.current || !myPosition) return;
+    if (youRef.current) mapRef.current.removeLayer(youRef.current);
+    youRef.current = L.marker(myPosition, { icon: youIcon(), zIndexOffset: 700 })
+      .bindTooltip("You are here").addTo(mapRef.current);
+  }, [myPosition?.[0], myPosition?.[1]]);
+
+  return (
+    <div className="report-map">
+      <div ref={mapNode} data-testid="map-report-location" />
+      {myPosition && (
+        <button type="button" className="map-recentre" onClick={() => mapRef.current?.flyTo(myPosition, 17, { duration: .5 })} title="Centre on my location" data-testid="button-recentre-report">
+          <LocateFixed size={16} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* -------------------------------------------------------- issue detail */
 
 function VerificationPanel({ issue }) {
   const [busy, setBusy] = useState(false);
@@ -368,8 +564,7 @@ function VerificationPanel({ issue }) {
   });
   const confirmations = counts.confirmations;
   const disputes = counts.disputes;
-  const total = confirmations + disputes;
-  const trust = total ? Math.round((confirmations / total) * 100) : null;
+  const standing = communityStanding({ confirmations, disputes });
 
   const cast = async (next) => {
     setBusy(true);
@@ -389,29 +584,34 @@ function VerificationPanel({ issue }) {
   };
 
   return (
-    <div className="verify-panel" data-testid={`panel-verify-${issue.id}`}>
+    <div className={`verification ${standing.key}`} data-testid={`panel-verify-${issue.id}`}>
+      {standing.key === "verified" && (
+        <div className="verified-banner" data-testid={`banner-standing-${issue.id}`}>
+          <ShieldCheck size={16} />Community verified at {confirmations} confirmations
+        </div>
+      )}
+      {standing.key === "disputed" && (
+        <div className="verified-banner disputed" data-testid={`banner-standing-${issue.id}`}>
+          <AlertTriangle size={16} />Disputed by {disputes} residents
+        </div>
+      )}
       <div className="verify-head">
         <div>
-          <div className="eyebrow">Community check</div>
-          <p className="subhead">Seen this yourself? Residents verify each report so the ward office knows what is real.</p>
+          <p className="eyebrow">Community signal</p>
+          <strong>{standing.label}</strong>
         </div>
-        {trust !== null && (
-          <div className={`trust-badge ${trust >= 60 ? "trust-good" : trust >= 40 ? "trust-mixed" : "trust-poor"}`} data-testid={`badge-trust-${issue.id}`}>
-            <strong>{trust}%</strong>
-            <span>{total} checked</span>
-          </div>
-        )}
+        <span>{confirmations}/{VERIFIED_AT} confirmations</span>
       </div>
-      <div className="verify-counts">
-        <span data-testid={`text-confirmations-${issue.id}`}><CheckCircle2 size={14} />{confirmations} confirmed it is there</span>
-        <span data-testid={`text-disputes-${issue.id}`}><X size={14} />{disputes} could not find it</span>
+      <div className={`progress ${standing.key === "disputed" ? "disputed" : ""}`}>
+        <i style={{ width: `${Math.min((confirmations / VERIFIED_AT) * 100, 100)}%` }} />
       </div>
-      <div className="verify-actions">
-        <button type="button" className={`button ${verdict === "confirm" ? "button-primary" : "button-secondary"}`} disabled={busy} onClick={() => cast("confirm")} data-testid={`button-confirm-${issue.id}`}>
-          <CheckCircle2 size={14} />{verdict === "confirm" ? "You confirmed this" : "I can see it"}
+      {standing.message && <p className="verify-note">{standing.message}</p>}
+      <div className="verify-actions" style={{ marginTop: 12 }}>
+        <button type="button" className={verdict === "confirm" ? "chosen" : ""} disabled={busy} onClick={() => cast("confirm")} data-testid={`button-confirm-${issue.id}`}>
+          <CheckCircle2 size={14} />{verdict === "confirm" ? "You confirmed" : "I can see it"} <b>{confirmations}</b>
         </button>
-        <button type="button" className={`button ${verdict === "dispute" ? "button-primary" : "button-secondary"}`} disabled={busy} onClick={() => cast("dispute")} data-testid={`button-dispute-${issue.id}`}>
-          <X size={14} />{verdict === "dispute" ? "You disputed this" : "Not there any more"}
+        <button type="button" className={verdict === "dispute" ? "chosen" : ""} disabled={busy} onClick={() => cast("dispute")} data-testid={`button-dispute-${issue.id}`}>
+          <X size={14} />{verdict === "dispute" ? "You disputed" : "Not there any more"} <b>{disputes}</b>
         </button>
       </div>
       {note && <div className="help-text">{note}</div>}
@@ -419,12 +619,36 @@ function VerificationPanel({ issue }) {
   );
 }
 
-function IssueDetailModal({ issue, onClose, onUpvote, canBack = true }) {
+function StatusTimeline({ issue }) {
+  const order = ["pending", "in_progress", "resolved"];
+  const reached = order.indexOf(issue.status);
+  const steps = [
+    ["Report submitted", formatDateTime(issue.created_at)],
+    ["Ward office review", issue.status === "pending" ? "Waiting for review" : "Acknowledged by the ward office"],
+    ["Resolved", issue.status === "resolved" ? "Marked fixed" : "Not completed"],
+  ];
+  return (
+    <div className="timeline" data-testid="timeline-issue-status">
+      <p className="eyebrow">Status timeline</p>
+      {steps.map(([label, note], index) => (
+        <div className={`timeline-item${index <= reached ? " done" : ""}`} key={label}>
+          <i />
+          <div><strong>{label}</strong><span>{note}</span></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function IssueDetailModal({ issue, onClose, onUpvote }) {
   const [isBacking, setIsBacking] = useState(false);
   const [backed, setBacked] = useState(issue?.backed_by_me);
+  const [tab, setTab] = useState("detail");
+  const me = useMe();
   if (!issue) return null;
+  const isMine = me.id != null && issue.user_id === me.id;
   const standing = communityStanding(issue);
-  const Icon = CATEGORY_ICONS[issue.category] || Flag;
+
   const handleBack = async () => {
     if (backed || isBacking) return;
     setIsBacking(true);
@@ -432,100 +656,92 @@ function IssueDetailModal({ issue, onClose, onUpvote, canBack = true }) {
     setBacked(true);
     setIsBacking(false);
   };
+
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className={`modal standing-${standing.key}`} role="dialog" aria-modal="true" aria-labelledby="issue-detail-title" data-testid="modal-issue-detail">
-        {standing.message && (
-          <div className={`standing-banner banner-${standing.key}`} data-testid={`banner-standing-${issue.id}`}>
-            {standing.key === "verified" ? <ShieldCheck size={16} /> : standing.key === "disputed" ? <AlertTriangle size={16} /> : <CircleHelp size={16} />}
-            <div>
-              <strong>{standing.label}</strong>
-              <span>{standing.message}</span>
+    <div className="overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="detail-modal" role="dialog" aria-modal="true" aria-labelledby="issue-detail-title" data-testid="modal-issue-detail">
+        <button className="back-link" onClick={onClose} data-testid="button-close-issue-detail">
+          <ArrowLeft size={17} /> Back to queue
+        </button>
+        <div className="detail-layout">
+          <div className="detail-media" data-testid={`photo-issue-${issue.id}`}>
+            {issue.photo_url ? (
+              issue.media_type === "video"
+                ? <video src={issue.photo_url} controls />
+                : <img src={issue.photo_url} alt={`Street evidence for report ${issue.id}`} />
+            ) : (
+              <div className="thumb-empty">
+                <CloudUpload size={22} />
+                <strong>No photo attached</strong>
+                <span>Residents add a street-level photo when filing.</span>
+              </div>
+            )}
+            {issue.photo_url && (
+              <div className="media-tag">
+                <Camera size={14} /> {issue.media_type === "video" ? "Video evidence" : "Photo evidence"}
+                {issue.geo_source === "exif" ? " · camera GPS" : ""}
+              </div>
+            )}
+          </div>
+
+          <div className="detail-body">
+            <div className="detail-heading">
+              <div>
+                <div className="row-top" style={{ flexDirection: "row", justifyContent: "flex-start" }}>
+                  <Badge tone={issue.status}>{STATUS_LABELS[issue.status]}</Badge>
+                  <span>{issueRef(issue)}</span>
+                </div>
+                <h2 id="issue-detail-title">{CATEGORY_LABELS[issue.category]}</h2>
+                <p className="issue-meta">Reported by {issue.reporter} · {formatDate(issue.created_at)} · {locationLabel(issue)}</p>
+              </div>
+              <Score score={issue.priority_score} />
+            </div>
+
+            <div className="detail-tabs">
+              <button className={tab === "detail" ? "active" : ""} onClick={() => setTab("detail")} data-testid="tab-detail">Report details</button>
+              <button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")} data-testid="tab-activity">Activity</button>
+            </div>
+
+            {tab === "detail" ? (
+              <>
+                <p className="detail-body-copy">{issue.description}</p>
+                <div className="score-breakdown">
+                  <div><span>Severity</span><strong>{issue.severity} × 10</strong></div>
+                  <div><span>Resident backing</span><strong>+ {issue.upvotes}</strong></div>
+                  <div className="total"><span>Total priority</span><strong>{issue.priority_score}</strong></div>
+                </div>
+                <div className="detail-facts">
+                  <div><span>Land classification</span><strong>{issue.land_class === "private" ? "Private" : issue.land_class === "public" ? "Public" : "Unknown"}</strong></div>
+                  <div><span>Location source</span><strong>{issue.geo_source === "exif" ? "Photo GPS" : issue.geo_source === "manual" ? "Placed by hand" : "Device GPS"}</strong></div>
+                  <div><span>Backed by</span><strong>{issue.upvotes} residents</strong></div>
+                </div>
+                {isMine
+                  ? <div className="own-note"><ShieldCheck size={15} /><span>This is your report. Backing and verification come from other residents, so the priority score stays a measure of what the ward actually agrees on.</span></div>
+                  : <VerificationPanel issue={issue} />}
+              </>
+            ) : (
+              <>
+                <StatusTimeline issue={issue} />
+                {standing.key === "unchecked" && <div className="empty-activity">No resident has checked this report on the ground yet.</div>}
+              </>
+            )}
+
+            <div className="detail-actions">
+              <button className="button secondary" onClick={onClose} data-testid="button-dismiss-detail">Close</button>
+              {!isMine && (
+                <button className="button amber" disabled={backed || isBacking} onClick={handleBack} data-testid={`button-back-issue-${issue.id}`}>
+                  <ThumbsUp size={15} />{backed ? "Backed by you" : isBacking ? "Recording…" : "Back this issue"}
+                </button>
+              )}
             </div>
           </div>
-        )}
-        <div className="modal-head">
-          <div><div className="eyebrow">{issue.id} · filed {formatDate(issue.created_at)}</div><h2 id="issue-detail-title"><Icon size={19} style={{ verticalAlign: "-3px", marginRight: 7 }} />{CATEGORY_LABELS[issue.category]}</h2></div>
-          <button className="close-button" onClick={onClose} aria-label="Close issue detail" data-testid="button-close-issue-detail"><X size={18} /></button>
-        </div>
-        <div className="modal-body">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}><StatusChip status={issue.status} /><span className="help-text">{locationLabel(issue)}</span></div>
-          <div className="issue-photo" data-testid={`photo-issue-${issue.id}`}>{issue.photo_url ? <img src={issue.photo_url} alt={`Street evidence for ${issue.id}`} /> : <div><CloudUpload size={20} /><strong>No photo attached</strong><span>Residents can add a street-level photo when filing.</span></div>}</div>
-          <div className="detail-score"><Score score={issue.priority_score} large /><div><div className="score-calculation"><span>{issue.severity} severity × 10</span><b>+</b><span>{issue.upvotes} resident backing</span><b>=</b><strong>{issue.priority_score}</strong></div><span>Priority is calculated from severity and resident backing. Higher scores are reviewed first by the ward office.</span></div></div>
-          <p className="detail-copy">{issue.description}</p>
-          <div className="detail-meta">
-            <div><span>Reported by</span><strong>{issue.reporter}</strong></div>
-            <div><span>Severity</span><strong>{issue.severity} / 5</strong></div>
-            <div><span>Backed by</span><strong>{issue.upvotes} residents</strong></div>
-          </div>
-          <div className="detail-timeline"><div className="eyebrow">Status trail</div><StatusTimeline status={issue.status} /></div>
-        </div>
-        <VerificationPanel issue={issue} />
-        <div className="modal-actions">
-          <button className="button button-secondary" onClick={onClose} data-testid="button-dismiss-detail">Close</button>
-          {canBack && <button className="button button-amber" disabled={backed || isBacking} onClick={handleBack} data-testid={`button-back-issue-${issue.id}`}><ThumbsUp size={15} />{backed ? "Backed by you" : isBacking ? "Recording…" : "Back this issue"}</button>}
         </div>
       </section>
     </div>
   );
 }
 
-function MapCanvas({ issues, onSelect }) {
-  const mapNode = useRef(null);
-  const mapRef = useRef(null);
-  useMapAutosize(mapRef, mapNode);
-  const markerLayerRef = useRef(null);
-  const youLayerRef = useRef(null);
-  const centredRef = useRef(false);
-  const { position, accuracy } = useMyPosition();
-  const onSelectRef = useRef(onSelect);
-  onSelectRef.current = onSelect;
-  useEffect(() => {
-    if (!mapNode.current || mapRef.current) return undefined;
-    const map = L.map(mapNode.current, { zoomControl: false, attributionControl: true }).setView([12.9719, 77.5945], 15);
-    L.control.zoom({ position: "bottomright" }).addTo(map);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 19 }).addTo(map);
-    markerLayerRef.current = L.layerGroup().addTo(map);
-    youLayerRef.current = L.layerGroup().addTo(map);
-    mapRef.current = map;
-    const sizeTimer = window.setTimeout(() => { if (mapRef.current === map) map.invalidateSize(); }, 100);
-    return () => { window.clearTimeout(sizeTimer); map.remove(); mapRef.current = null; };
-  }, []);
-  useEffect(() => {
-    if (!markerLayerRef.current) return;
-    markerLayerRef.current.clearLayers();
-    issues.forEach((issue) => {
-      const band = scoreBand(issue.priority_score);
-      const color = band === "red" ? "#b7473f" : band === "amber" ? "#c98525" : "#8e9ba7";
-      const marker = L.marker([issue.latitude, issue.longitude], { icon: L.divIcon({ className: "", html: `<div class="marker-pin ${issue.status === "resolved" ? "marker-resolved" : ""}" style="background:${color}"><span>${issue.priority_score}</span></div>`, iconSize: [26, 26], iconAnchor: [13, 26] }) });
-      marker.on("click", () => onSelectRef.current(issue));
-      marker.bindTooltip(`${CATEGORY_LABELS[issue.category]} · ${issue.priority_score}`, { direction: "top", offset: [0, -19] });
-      marker.addTo(markerLayerRef.current);
-    });
-  }, [issues]);
-
-  /* drop a "you are here" dot, and centre on it the first time it arrives */
-  useEffect(() => {
-    if (!youLayerRef.current || !position) return;
-    youLayerRef.current.clearLayers();
-    L.marker(position, { icon: youIcon(), zIndexOffset: 700 })
-      .bindTooltip("You are here").addTo(youLayerRef.current);
-    if (accuracy && accuracy > 60) {
-      L.circle(position, { radius: accuracy, color: "#2b6ca3", weight: 1, fillOpacity: .06, interactive: false })
-        .addTo(youLayerRef.current);
-    }
-    if (!centredRef.current) { mapRef.current?.setView(position, 15); centredRef.current = true; }
-  }, [position?.[0], position?.[1], accuracy]);
-
-  const recentre = () => { if (position) mapRef.current?.flyTo(position, 16, { duration: .6 }); };
-
-  return <div className="map-wrap"><div ref={mapNode} data-testid="map-issue-map" />{position && <button type="button" className="map-recentre" onClick={recentre} title="Centre on my location" data-testid="button-recentre-map"><LocateFixed size={16} /></button>}<div className="map-legend"><span className="legend-item"><i className="legend-dot" style={{ background: "var(--red)" }} />urgent 65+</span><span className="legend-item"><i className="legend-dot" style={{ background: "var(--amber)" }} />watch 40–64</span><span className="legend-item"><i className="legend-dot" style={{ background: "var(--grey-band)" }} />queued</span></div></div>;
-}
-
-function CategoryFilterChips({ issues, value, onChange }) {
-  const options = [["all", "All"], ...Object.entries(CATEGORY_LABELS)];
-  return <div className="category-chips" role="group" aria-label="Filter by issue category">{options.map(([category, label]) => <button className={`category-chip ${value === category ? "active" : ""}`} onClick={() => onChange(category)} key={category} data-testid={`button-filter-category-${category}`}><span>{label}</span><b>{category === "all" ? issues.length : issues.filter((issue) => issue.category === category).length}</b></button>)}</div>;
-}
+/* ------------------------------------------------------------- map page */
 
 function MapPage() {
   const { issues, isLoading, error, refresh } = useIssueFeed();
@@ -535,102 +751,135 @@ function MapPage() {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(null);
   const [toast, setToast] = useToast();
-  const filtered = useMemo(() => issues.filter((issue) => (category === "all" || issue.category === category) && (status === "all" || issue.status === status) && `${issue.description} ${issue.category} ${locationLabel(issue)}`.toLowerCase().includes(search.toLowerCase())).sort((a, b) => sort === "recent" ? new Date(b.created_at) - new Date(a.created_at) : b.priority_score - a.priority_score), [issues, category, status, sort, search]);
+
+  const filtered = useMemo(() => issues
+    .filter((issue) =>
+      (category === "all" || issue.category === category) &&
+      (status === "all" || issue.status === status) &&
+      `${issue.description} ${issue.category} ${issue.id} ${locationLabel(issue)}`.toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => sort === "recent"
+      ? new Date(b.created_at) - new Date(a.created_at)
+      : sort === "backing" ? b.upvotes - a.upvotes : b.priority_score - a.priority_score),
+    [issues, category, status, sort, search]);
+
   const handleUpvote = async (id) => { await upvoteIssue(id); await refresh(); setToast("Your backing has been recorded."); };
-  const urgentCount = issues.filter((issue) => issue.priority_score >= 65 && issue.status !== "resolved").length;
+  const open = issues.filter((issue) => issue.status !== "resolved").length;
+
   return (
-    <AppShell title="Issue map">
-      <div className="page">
-        <PageHeader eyebrow="your ward · " title="See what needs fixing." description="A shared register of street-level issues. Back a report to make resident priorities visible to the ward office." action={<Link href="/report" className="button button-amber" data-testid="link-report-from-map"><FilePlus2 size={15} />Report an issue</Link>} />
-        <div className="stat-grid">
-          <div className="stat-card featured"><div className="stat-label">Open register</div><div className="stat-value">{issues.filter((issue) => issue.status !== "resolved").length}</div><div className="stat-meta">issues awaiting or receiving action</div></div>
-          <div className="stat-card"><div className="stat-label">Urgent attention</div><div className="stat-value band-red">{urgentCount}</div><div className="stat-meta">priority score 65 and above</div></div>
-          <div className="stat-card"><div className="stat-label">In progress</div><div className="stat-value">{issues.filter((issue) => issue.status === "in_progress").length}</div><div className="stat-meta">ward action is underway</div></div>
-          <div className="stat-card"><div className="stat-label">Resolved this month</div><div className="stat-value band-amber">{issues.filter((issue) => issue.status === "resolved").length}</div><div className="stat-meta">closed with a status update</div></div>
+    <AppShell>
+      <main className="map-page">
+        <div className="map-panel">
+          {isLoading ? <LoadingPanel /> : error ? <ErrorPanel onRetry={refresh} /> : <MapCanvas issues={filtered} onSelect={setSelected} />}
+          <div className="map-title">
+            <div>
+              <p className="eyebrow">Your ward</p>
+              <strong>{open} active report{open === 1 ? "" : "s"}</strong>
+            </div>
+            <Link href="/report" className="button amber" data-testid="link-report-from-map">
+              <Plus size={17} /> Report issue
+            </Link>
+          </div>
         </div>
-        <div className="filter-row">
-          <div style={{ position: "relative", flex: 1, minWidth: 190 }}><Search size={15} style={{ position: "absolute", left: 11, top: 12, color: "var(--muted)" }} /><input className="input search-input" style={{ width: "100%", paddingLeft: 32 }} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search the ward register" data-testid="input-search-issues" /></div>
-          <select className="filter-select" value={status} onChange={(event) => setStatus(event.target.value)} data-testid="select-filter-status"><option value="all">All statuses</option>{Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
-          <div className="segmented"><button className={sort === "priority" ? "active" : ""} onClick={() => setSort("priority")} data-testid="button-sort-priority"><ArrowDownUp size={12} /> Priority</button><button className={sort === "recent" ? "active" : ""} onClick={() => setSort("recent")} data-testid="button-sort-recent">Recent</button></div>
-        </div>
-        <CategoryFilterChips issues={issues} value={category} onChange={setCategory} />
-        <div className="map-layout">
-          <section className="panel map-panel"><div className="panel-header"><div><h2>Live issue map</h2><p>{filtered.length} visible reports · select a pin or queue item</p></div><button className="quiet-button" onClick={() => setToast("Map is centred on your ward.")} data-testid="button-centre-map"><LocateFixed size={14} />Centre ward</button></div>{isLoading ? <LoadingPanel /> : error ? <ErrorPanel onRetry={refresh} /> : <MapCanvas issues={filtered} onSelect={setSelected} />}</section>
-          <section className="panel"><div className="panel-header"><div><h2>Priority queue</h2><p>Ordered by score, highest first</p></div><ListFilter size={17} color="var(--muted)" /></div>{isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filtered.length ? <div className="issue-queue">{filtered.map((issue) => <IssueQueueCard key={issue.id} issue={issue} onSelect={setSelected} />)}</div> : <div className="empty-state" data-testid="state-empty-map"><Filter size={27} /><strong>No matching reports</strong><p>Try clearing a filter or searching another term.</p></div>}</section>
-        </div>
-      </div>
+
+        <section className="civic-queue">
+          <div className="section-head">
+            <div>
+              <h1>Priority queue <b className="queue-count">{filtered.length} issues</b></h1>
+              <p>Ranked by severity and resident backing</p>
+            </div>
+          </div>
+
+          <div className="search-input queue-search">
+            <Search size={17} />
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by description, place or ID" data-testid="input-search-issues" />
+          </div>
+
+          <CategoryChips issues={issues} value={category} onChange={setCategory} />
+
+          <div className="select-row">
+            <select value={status} onChange={(event) => setStatus(event.target.value)} data-testid="select-filter-status">
+              <option value="all">All statuses</option>
+              {Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+            <select value={sort} onChange={(event) => setSort(event.target.value)} data-testid="select-sort">
+              <option value="priority">Highest priority</option>
+              <option value="recent">Most recent</option>
+              <option value="backing">Most backed</option>
+            </select>
+          </div>
+
+          {isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filtered.length ? (
+            <div className="queue-list">
+              {filtered.map((issue) => <IssueRow key={issue.id} issue={issue} onSelect={setSelected} />)}
+            </div>
+          ) : (
+            <div className="empty-state" data-testid="state-empty-map">
+              <Filter size={27} />
+              <strong>No matching reports</strong>
+              <p>Clear a filter, or search another term.</p>
+            </div>
+          )}
+        </section>
+      </main>
+
       <IssueDetailModal issue={selected} onClose={() => setSelected(null)} onUpvote={handleUpvote} />
       {toast && <div className="toast" role="status" data-testid="toast-map">{toast}</div>}
     </AppShell>
   );
 }
 
+/* -------------------------------------------------------- duplicate check */
+
 function DuplicateModal({ nearby, onClose, onSupport, onCreateNew }) {
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal" role="dialog" aria-modal="true" data-testid="modal-duplicate-warning">
-        <div className="modal-head"><div><div className="eyebrow">Before you file</div><h2>There may already be a report here.</h2></div><button className="close-button" onClick={onClose} aria-label="Close duplicate warning" data-testid="button-close-duplicate"><X size={18} /></button></div>
-        <div className="modal-body"><p className="detail-copy">We found {nearby.length === 1 ? "an existing report" : `${nearby.length} existing reports`} within 50 metres. Supporting one helps the ward office see the combined need without creating a duplicate.</p><div className="duplicate-list">{nearby.map((issue) => <div className="duplicate-card" key={issue.id}><div><strong>{CATEGORY_LABELS[issue.category]} · {issue.id}</strong><span>{Math.round(issue.distance_meters ?? 0)}m away · {issue.upvotes} supporters</span><p>{issue.description}</p></div><button className="button button-secondary" onClick={() => onSupport(issue)} data-testid={`button-support-duplicate-${issue.id}`}><ThumbsUp size={13} />Back report</button></div>)}</div></div>
-        <div className="modal-actions"><button className="button button-secondary" onClick={onClose} data-testid="button-cancel-report">Cancel</button><button className="button button-amber" onClick={onCreateNew} data-testid="button-create-new-anyway">Create new anyway <ArrowRight size={14} /></button></div>
+    <div className="overlay nested" role="presentation">
+      <section className="duplicate-modal" role="dialog" aria-modal="true" data-testid="modal-duplicate-warning">
+        <div className="duplicate-icon"><Siren size={22} /></div>
+        <p className="eyebrow">Possible duplicate</p>
+        <h2>Someone may have already reported this.</h2>
+        <p>
+          We found {nearby.length === 1 ? "an existing report" : `${nearby.length} existing reports`} within 50 metres in
+          the same category. Backing one shows the ward office the full scale of the problem instead of splitting it in two.
+        </p>
+        <div className="nearby-list">
+          {nearby.map((issue) => (
+            <div className="nearby" key={issue.id}>
+              {issue.photo_url ? <img src={issue.photo_url} alt="" /> : <div className="thumb-empty" style={{ width: 58, height: 46, borderRadius: 3 }}><CloudUpload size={14} /></div>}
+              <div>
+                <strong>{issue.description}</strong>
+                <span>{issueRef(issue)} · {Math.round(issue.distance_meters ?? 0)} m away · {issue.upvotes} backing{issue.upvotes === 1 ? "" : "s"}</span>
+              </div>
+              <button className="button secondary" onClick={() => onSupport(issue)} data-testid={`button-support-duplicate-${issue.id}`}>
+                <ThumbsUp size={13} />Back this one
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="duplicate-actions">
+          <button className="button secondary" onClick={onClose} data-testid="button-cancel-report">Cancel</button>
+          <button className="button amber" onClick={onCreateNew} data-testid="button-create-new-anyway">
+            File as a separate issue <ArrowUpRight size={16} />
+          </button>
+        </div>
       </section>
     </div>
   );
 }
 
-function ReportLocationMap({ latitude, longitude, onChange }) {
-  const youRef = useRef(null);
-  const { position: myPosition } = useMyPosition();
-  const mapNode = useRef(null);
-  const mapRef = useRef(null);
-  useMapAutosize(mapRef, mapNode);
-  const markerRef = useRef(null);
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-  useEffect(() => {
-    if (!mapNode.current || mapRef.current) return undefined;
-    const initial = [Number(latitude), Number(longitude)];
-    const map = L.map(mapNode.current, { zoomControl: true, attributionControl: true }).setView(initial, 16);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 19 }).addTo(map);
-    const marker = L.marker(initial, { draggable: true }).addTo(map);
-    marker.bindTooltip("Drag or click to place", { direction: "top", offset: [0, -20] }).openTooltip();
-    marker.on("dragend", () => {
-      const point = marker.getLatLng();
-      onChangeRef.current(point.lat, point.lng);
-    });
-    map.on("click", (event) => {
-      marker.setLatLng(event.latlng);
-      onChangeRef.current(event.latlng.lat, event.latlng.lng);
-    });
-    mapRef.current = map;
-    markerRef.current = marker;
-    const sizeTimer = window.setTimeout(() => { if (mapRef.current === map) map.invalidateSize(); }, 80);
-    return () => { window.clearTimeout(sizeTimer); map.remove(); mapRef.current = null; markerRef.current = null; };
-  }, []);
-  useEffect(() => {
-    if (!markerRef.current) return;
-    const point = [Number(latitude), Number(longitude)];
-    markerRef.current.setLatLng(point);
-    mapRef.current?.panTo(point, { animate: true, duration: .25 });
-  }, [latitude, longitude]);
-  useEffect(() => {
-    if (!mapRef.current || !myPosition) return;
-    if (youRef.current) mapRef.current.removeLayer(youRef.current);
-    youRef.current = L.marker(myPosition, { icon: youIcon(), zIndexOffset: 700 })
-      .bindTooltip("You are here").addTo(mapRef.current);
-  }, [myPosition?.[0], myPosition?.[1]]);
+/* ----------------------------------------------------------- report flow */
 
-  return <div className="report-map-wrap"><div ref={mapNode} data-testid="map-report-location" />{myPosition && <button type="button" className="map-recentre" onClick={() => mapRef.current?.flyTo(myPosition, 17, { duration: .5 })} title="Centre on my location" data-testid="button-recentre-report"><LocateFixed size={16} /></button>}<div className="report-map-hint"><LocateFixed size={13} />Drag the pin or click the map to place it</div></div>;
-}
+const WIZARD_STEPS = ["Evidence", "Category", "Severity", "Details", "Location"];
 
 function ReportPage() {
   const [, setLocation] = useLocation();
+  const [step, setStep] = useState(1);
   const [category, setCategory] = useState("pothole");
   const [description, setDescription] = useState("");
   const [severity, setSeverity] = useState(3);
   const [latitude, setLatitude] = useState("");
   const [longitude, setLongitude] = useState("");
   const [accuracy, setAccuracy] = useState(null);
-  const [geoState, setGeoState] = useState("locating");   // locating | ready | blocked | manual
+  const [geoState, setGeoState] = useState("locating");   // locating | ready | blocked | manual | exif
   const [photoName, setPhotoName] = useState("");
   const [photoPreview, setPhotoPreview] = useState("");
   const [mediaFile, setMediaFile] = useState(null);
@@ -645,12 +894,16 @@ function ReportPage() {
     require_geotag: true, require_video: true, require_public_land: true, max_photo_age_hours: 24
   });
   useEffect(() => { getPolicy().then(setPolicy).catch(() => {}); }, []);
+  const [quota, setQuota] = useState(null);
+  useEffect(() => { getReportQuota().then(setQuota).catch(() => {}); }, []);
   const [devicePos, setDevicePos] = useState(null);
   const [addressQuery, setAddressQuery] = useState("");
   const [lookupMessage, setLookupMessage] = useState("");
   const [nearby, setNearby] = useState([]);
   const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
   const [toast, setToast] = useToast();
+
   const setCoordinates = (nextLatitude, nextLongitude) => {
     setLatitude(Number(nextLatitude).toFixed(6));
     setLongitude(Number(nextLongitude).toFixed(6));
@@ -673,6 +926,7 @@ function ReportPage() {
     );
   };
   useEffect(() => { locateMe(); }, []);
+
   /* Photos may carry a GPS tag. We read it to show where the picture was actually
      taken, but never reject a file for lacking one. */
   const handleMedia = async (event) => {
@@ -750,8 +1004,12 @@ function ReportPage() {
   const submitReport = async (force = false) => {
     if (!description.trim() || submitting) return;
     if (!latitude || !longitude) { setToast("Set a location before filing."); return; }
-    if (!mediaFile || !exifInfo?.hasGps) { setToast("A geotagged photo is required."); return; }
-    if (!videoFile) { setToast("A short video is required."); return; }
+    /* These mirror what the server enforces, which it tells us in /issues/policy.
+       Hardcoding them meant that relaxing REQUIRE_GEOTAG for phone uploads left the
+       submit button enabled while this guard silently refused the report. */
+    if (!mediaFile) { setToast("A photo of the issue is required."); return; }
+    if (policy.require_geotag && !exifInfo?.hasGps) { setToast("A geotagged photo is required."); return; }
+    if (policy.require_video && !videoFile) { setToast("A short video is required."); return; }
     setSubmitting(true);
     const location = { latitude: Number(latitude), longitude: Number(longitude) };
     if (!force) {
@@ -759,86 +1017,146 @@ function ReportPage() {
       if (matches.length) { setNearby(matches.map((issue) => ({ ...issue, distance_meters: distanceInMeters(location, issue) }))); setSubmitting(false); return; }
     }
     await createIssue({ category, description: description.trim(), severity, latitude: location.latitude, longitude: location.longitude, photo_url: photoPreview, photo_file: mediaFile, video_file: videoFile, pinned_by_hand: geoState === "manual", accept_private: acceptPrivate, device_lat: devicePos?.[0], device_lng: devicePos?.[1] });
-    setSubmitting(false); setNearby([]); setToast("Report added to the the civic register."); setDescription(""); setPhotoName(""); setPhotoPreview("");
-    window.setTimeout(() => setLocation("/my-reports"), 700);
+    setSubmitting(false); setNearby([]); setSubmitted(true);
+    window.setTimeout(() => setLocation("/my-reports"), 1800);
   };
-  const supportAndGo = async (issue) => { await backIssue(issue.id); setNearby([]); setSubmitting(false); setToast(`You backed ${issue.id}. No duplicate was filed.`); window.setTimeout(() => setLocation("/map"), 700); };
+
+  const supportAndGo = async (issue) => { await backIssue(issue.id); setNearby([]); setSubmitting(false); setToast(`You backed ${issueRef(issue)}. No duplicate was filed.`); window.setTimeout(() => setLocation("/map"), 700); };
+
+  /* every rule the submit button enforces, named once so the checklist can show them */
+  const photoOk = Boolean(mediaFile) && (!policy.require_geotag || Boolean(exifInfo?.hasGps));
+  const videoOk = !policy.require_video || Boolean(videoFile);
+  const descriptionOk = description.trim().length >= 10;
+  const landOk = !(land?.land_class === "private" && land?.enforced && !acceptPrivate);
+  const driftOk = !(policy.require_geotag && exifInfo?.gap != null && exifInfo.gap > (policy.max_exif_drift_m || 2000));
+  const freshOk = !(policy.max_photo_age_hours > 0 && exifInfo?.ageHours != null && exifInfo.ageHours > policy.max_photo_age_hours);
+  const quotaOk = !quota || quota.remaining > 0;
+  const blocked = !photoOk || !videoOk || !descriptionOk || !landOk || !driftOk || !freshOk || !latitude || !longitude || !quotaOk;
+
+  const checklist = [
+    ["Photo evidence", photoOk, !mediaFile ? null : !photoOk],
+    ["Video evidence", videoOk, !videoFile ? null : !videoOk],
+    ["Issue category", Boolean(category), null],
+    [`Severity rating (${severity}/5)`, Boolean(severity), null],
+    [`Description (${description.trim().length}/10)`, descriptionOk, null],
+    ["Location pin set", Boolean(latitude && longitude), null],
+    ["Photo is recent", freshOk, exifInfo?.ageHours == null ? null : !freshOk],
+    ["Public right of way", landOk, land?.land_class !== "private" ? null : !landOk],
+    [quota ? `Daily allowance (${quota.remaining}/${quota.limit} left)` : "Daily allowance", quotaOk, !quotaOk],
+  ];
+
+  if (submitted) {
+    return (
+      <AppShell>
+        <main className="report-page" data-testid="state-report-submitted">
+          <div className="success-state">
+            <Check size={38} />
+            <h2>Report filed</h2>
+            <p>It is on the ward register now, and open for residents to confirm on the ground.</p>
+            <Link href="/my-reports" className="button amber">Go to my reports</Link>
+          </div>
+        </main>
+      </AppShell>
+    );
+  }
+
   return (
-    <AppShell title="Report an issue">
-      <div className="page">
-        <PageHeader eyebrow="New register entry" title="Make the problem legible." description="A clear report gives the ward office a location, a priority signal, and a reason to act." />
+    <AppShell>
+      <main className="report-page">
+        <div className="report-head">
+          <div>
+            <p className="eyebrow">New register entry</p>
+            <h1>Report a civic issue</h1>
+            <p>
+              Step {step} of 5 · a geotagged photo and a short clip are both required
+              {quota && ` · ${quota.remaining} of ${quota.limit} reports left today`}
+            </p>
+          </div>
+          <Link href="/map" className="report-close" aria-label="Close the report form" data-testid="link-cancel-report">
+            <X size={24} />
+          </Link>
+        </div>
+
+        <div className="stepper">
+          {WIZARD_STEPS.map((name, index) => {
+            const number = index + 1;
+            return (
+              <button
+                key={name}
+                className={step === number ? "active" : step > number ? "complete" : ""}
+                onClick={() => setStep(number)}
+                data-testid={`button-step-${number}`}
+              >
+                <b>{step > number ? <Check size={13} /> : number}</b><small>{name}</small>
+              </button>
+            );
+          })}
+        </div>
+
         <div className="report-layout">
-          <section className="panel form-panel">
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Issue details</div>
-            <h2>What needs attention?</h2>
-            <p className="subhead" style={{ marginBottom: 24 }}>Keep it specific. Mention the landmark, what is unsafe, and how long it has been happening.</p>
-            <div className="form-grid">
-              <div className="field"><label htmlFor="issue-category">Category</label><select id="issue-category" className="filter-select" value={category} onChange={(event) => setCategory(event.target.value)} data-testid="select-report-category">{Object.entries(CATEGORY_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></div>
-              <div className="field"><label>Severity</label><div className="range-row"><input type="range" min="1" max="5" value={severity} onChange={(event) => setSeverity(Number(event.target.value))} data-testid="input-report-severity" /><div className="severity-value" data-testid="text-report-severity">{severity}</div></div><div className="help-text">1 is inconvenient. 5 is an immediate safety concern.</div></div>
-              <div className="field full"><label htmlFor="issue-description">Description</label><textarea id="issue-description" className="textarea" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Example: A deep pothole opens across the left lane, 20m after the bus stop…" data-testid="input-report-description" /><div className="help-text">{description.length}/500 characters</div></div>
-              <div className="field full">
-                <div className="selected-category" data-testid="text-selected-category">
-                  <span className="eyebrow">Filing under</span>
-                  <strong>{CATEGORY_LABELS[category]}</strong>
-                  <span className="chip-note">severity {severity} · {severity * 10} points before backing</span>
-                </div>
-                {land && (
-                  <div className={`land-note land-${land.land_class}`} data-testid="text-land-class">
-                    {land.land_class === "public" && <><ShieldCheck size={14} /><span><strong>Public land.</strong> {land.land_note}</span></>}
-                    {land.land_class === "private" && (
-                      <><AlertTriangle size={14} />
-                        <span>
-                          <strong>This looks like private property.</strong> {land.land_note}{" "}
-                          The register covers roads, footpaths, drains and public spaces. Map data is not
-                          perfect though — if this really is a public spot, you can file it anyway and the
-                          ward office will see that you confirmed it.
-                          {acceptPrivate ? (
-                            <span className="private-ack" data-testid="text-private-confirmed">
-                              <Check size={13} /> Filing anyway. This will be flagged for the ward office.{" "}
-                              <button type="button" className="quiet-button" onClick={() => setAcceptPrivate(false)} data-testid="button-undo-private">Undo</button>
-                            </span>
-                          ) : (
-                            <span className="private-choice">
-                              <button type="button" className="button button-secondary" onClick={() => setAcceptPrivate(true)} data-testid="button-continue-private">
-                                Yes, continue anyway
-                              </button>
-                              <button type="button" className="quiet-button" onClick={() => { setGeoState("manual"); setToast("Drag the pin to the public road or footpath."); }} data-testid="button-move-pin">
-                                Move the pin instead
-                              </button>
-                            </span>
-                          )}
-                        </span>
-                      </>
-                    )}
-                    {land.land_class === "unknown" && <><CircleHelp size={14} /><span>{land.land_note}</span></>}
-                  </div>
-                )}
+          <div className="form-card wizard-card">
+            {quota && quota.remaining <= 0 && (
+              <div className="quota-note" data-testid="notice-quota-spent">
+                <AlertTriangle size={16} />
+                <span>
+                  <strong>You have used all {quota.limit} reports for today.</strong> The allowance frees up
+                  as your earlier reports pass 24 hours old
+                  {quota.resets_at ? `, the first at about ${new Intl.DateTimeFormat("en-IN", { hour: "2-digit", minute: "2-digit" }).format(new Date(quota.resets_at))}` : ""}.
+                  If something needs attention before then, back an existing report on the map instead.
+                </span>
               </div>
-              <div className="field full"><label htmlFor="report-address-search">Find a landmark</label><div className="location-search"><input id="report-address-search" className="input" value={addressQuery} onChange={(event) => setAddressQuery(event.target.value)} placeholder="Try Infantry Road or Russell Market" data-testid="input-report-address-search" /><button type="button" className="button button-secondary" onClick={lookupAddress} data-testid="button-lookup-address"><Search size={14} />Find location</button></div><div className="help-text">{lookupMessage || "Searches OpenStreetMap for a street or landmark."}</div></div>
-              <div className="field full">
-                <label>Your location</label>
-                <div className="location-search">
-                  <button type="button" className="button button-secondary" onClick={() => locateMe(true)} data-testid="button-use-my-location">
-                    <LocateFixed size={14} />{geoState === "locating" ? "Locating…" : "Use my current location"}
-                  </button>
-                  <div className="help-text" style={{ margin: 0 }}>
-                    {geoState === "locating" && "Asking your device for a position…"}
-                    {geoState === "ready" && `GPS fix from your device${accuracy ? ` · accurate to about ${Math.round(accuracy)} m` : ""}`}
-                    {geoState === "exif" && "Location taken from the photo itself."}
-                    {geoState === "manual" && "Pin set by hand. This is the spot that gets filed."}
-                    {geoState === "blocked" && "Location unavailable. Drag the pin or search a landmark."}
+            )}
+
+            {step === 1 && (
+              <section className="wizard-section">
+                <h3>Capture photo and video evidence</h3>
+                <p>Both are required. A moving clip is far harder to fake than a still, and the photo carries the GPS tag that fixes the location.</p>
+                <div className="evidence-grid">
+                  <div>
+                    <label htmlFor="issue-photo">
+                      Photo evidence
+                      <em className={mediaFile ? "" : "missing"}>{mediaFile ? "Attached" : "Required"}</em>
+                    </label>
+                    <div className={`evidence-drop${photoPreview ? " filled" : ""}`}>
+                      {photoPreview ? (
+                        <>
+                          {mediaKind === "video" ? <video src={photoPreview} controls /> : <img src={photoPreview} alt="Selected street evidence preview" />}
+                          <span className="evidence-caption">{photoName}</span>
+                        </>
+                      ) : (
+                        <>
+                          <ImagePlus size={25} />
+                          <strong>Add a photo</strong>
+                          <small>Use the phone camera app with location on</small>
+                        </>
+                      )}
+                      <input id="issue-photo" type="file" accept="image/*" onChange={handleMedia} data-testid="input-report-photo" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label htmlFor="issue-video">
+                      Video evidence
+                      <em className={videoFile ? "" : policy.require_video ? "missing" : ""}>{videoFile ? "Attached" : policy.require_video ? "Required" : "Optional"}</em>
+                    </label>
+                    <div className={`evidence-drop${videoPreview ? " filled" : ""}`}>
+                      {videoPreview ? (
+                        <>
+                          <video src={videoPreview} controls />
+                          <span className="evidence-caption">{videoName}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Video size={25} />
+                          <strong>Add a clip</strong>
+                          <small>A few seconds is enough</small>
+                        </>
+                      )}
+                      <input id="issue-video" type="file" accept="video/*" onChange={handleVideo} data-testid="input-report-video" />
+                    </div>
                   </div>
                 </div>
-                {geoState === "ready" && accuracy > 100 && (
-                  <div className="help-text">
-                    That is a rough fix — laptops guess from WiFi and IP. Drag the pin onto the real spot before filing.
-                  </div>
-                )}
-              </div>
-              <div className="field full"><ReportLocationMap latitude={latitude} longitude={longitude} onChange={(nextLat, nextLng) => { setCoordinates(nextLat, nextLng); setGeoState("manual"); }} /></div>
-              <div className="field"><label htmlFor="report-latitude">Latitude</label><input id="report-latitude" className="input" value={latitude} onChange={(event) => setLatitude(event.target.value)} data-testid="input-report-latitude" /></div>
-              <div className="field"><label htmlFor="report-longitude">Longitude</label><input id="report-longitude" className="input" value={longitude} onChange={(event) => setLongitude(event.target.value)} data-testid="input-report-longitude" /></div>
-              <div className="field full"><label>Photo evidence <span className="req-mark">{policy.require_geotag ? "geotagged, required" : "required"}</span></label><label className="upload-box" htmlFor="issue-photo">{photoPreview ? (mediaKind === "video" ? <video className="upload-preview" src={photoPreview} controls /> : <img className="upload-preview" src={photoPreview} alt="Selected street evidence preview" />) : <CloudUpload size={20} />}<strong>{photoName || "Add a street-level photo"}</strong><span className="help-text">Must carry a GPS tag — use your phone's camera app with location on</span><input id="issue-photo" type="file" accept="image/*" onChange={handleMedia} data-testid="input-report-photo" /></label>
+
                 {exifInfo && (
                   <div className={`geo-tag-note ${exifInfo.hasGps ? "geo-ok" : "geo-bad"}`} data-testid="text-exif-status">
                     {exifInfo.hasGps ? (
@@ -868,63 +1186,246 @@ function ReportPage() {
                         )}
                       </>
                     ) : (
-                      <>
-                        {policy.require_geotag ? (
-                          <>
-                            <strong>This photo has no location tag, so it cannot be used.</strong> Android strips
-                            location from photos picked through a browser, so this often fails on a phone even when
-                            the picture does have one. Upload from a computer, or ask an administrator to relax the
-                            rule.
-                          </>
-                        ) : (
-                          <>
-                            <strong>No location tag on this photo.</strong> That is fine — the report will use your
-                            device's GPS instead, which is captured at the moment you file.
-                          </>
-                        )}
-                      </>
+                      policy.require_geotag ? (
+                        <>
+                          <strong>This photo has no location tag, so it cannot be used.</strong> Android strips
+                          location from photos picked through a browser, so this often fails on a phone even when
+                          the picture does have one. Upload from a computer, or ask an administrator to relax the
+                          rule.
+                        </>
+                      ) : (
+                        <>
+                          <strong>No location tag on this photo.</strong> That is fine — the report will be filed
+                          at the pin on step 5, which came from your device's GPS. Check it is on the right spot
+                          before you submit.
+                        </>
+                      )
                     )}
                   </div>
-                )}</div>
+                )}
+              </section>
+            )}
 
-              <div className="field full">
-                <label>Video evidence <span className="req-mark">{policy.require_video ? "required" : "optional"}</span></label>
-                <label className="upload-box" htmlFor="issue-video">
-                  {videoPreview ? <video className="upload-preview" src={videoPreview} controls /> : <CloudUpload size={20} />}
-                  <strong>{videoName || "Add a short clip of the issue"}</strong>
-                  <span className="help-text">A few seconds is enough. Moving footage is far harder to fake than a still.</span>
-                  <input id="issue-video" type="file" accept="video/*" onChange={handleVideo} data-testid="input-report-video" />
-                </label>
-              </div>
+            {step === 2 && (
+              <section className="wizard-section">
+                <h3>Which department should get this?</h3>
+                <p>The category decides the squad the ward office dispatches, and it is what the duplicate check compares against.</p>
+                <div className="category-grid">
+                  {Object.entries(CATEGORY_LABELS).map(([value, label]) => {
+                    const Icon = CATEGORY_ICONS[value] || Flag;
+                    return (
+                      <button
+                        key={value}
+                        className={`category-choice${category === value ? " selected" : ""}`}
+                        onClick={() => setCategory(value)}
+                        data-testid={`button-category-${value}`}
+                      >
+                        <i><Icon size={20} /></i>
+                        <span><strong>{label}</strong><small>{CATEGORY_DESK[value]}</small></span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+
+            {step === 3 && (
+              <section className="wizard-section">
+                <h3>How severe is it?</h3>
+                <p>Severity contributes ten points per level to the priority score the server calculates. Resident backing adds the rest.</p>
+                <div className="severity-options">
+                  {SEVERITY_SCALE.map(([value, title, note]) => (
+                    <button
+                      key={value}
+                      className={`severity-choice${severity === value ? " selected" : ""}`}
+                      onClick={() => setSeverity(value)}
+                      data-testid={`button-severity-${value}`}
+                    >
+                      <span><strong>Level {value} · {title}</strong><small>{note}</small></span>
+                      <b>+{value * 10} pts</b>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {step === 4 && (
+              <section className="wizard-section">
+                <h3>Describe what you can see</h3>
+                <p>Name the landmark, say what is unsafe, and say how long it has been there.</p>
+                <textarea
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                  placeholder="Example: a deep pothole opens across the left lane, about 20 m after the bus stop, and two-wheelers are swerving into traffic to avoid it."
+                  data-testid="input-report-description"
+                />
+                <div className="char-row">
+                  <span>Between 10 and 1000 characters</span>
+                  <b>{description.trim().length}/1000</b>
+                </div>
+                <h4>Quick details to append</h4>
+                <div className="cue-row">
+                  {DESCRIPTION_CUES.map((cue) => (
+                    <button key={cue} onClick={() => setDescription(`${description} ${cue}`.trim())} data-testid={`button-cue-${cue.split(" ")[0]}`}>
+                      + {cue}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {step === 5 && (
+              <section className="wizard-section">
+                <h3>Confirm the exact spot</h3>
+                <p>The pin comes from your device, or from the photo's own GPS tag. Drag it onto the defect before filing.</p>
+
+                <div className="location-row">
+                  <input
+                    value={addressQuery}
+                    onChange={(event) => setAddressQuery(event.target.value)}
+                    placeholder="Search a street or landmark to jump the pin"
+                    data-testid="input-report-address-search"
+                  />
+                  <button type="button" className="button secondary" onClick={lookupAddress} data-testid="button-lookup-address">
+                    <Search size={14} />Find
+                  </button>
+                  <button type="button" className="button secondary" onClick={() => locateMe(true)} data-testid="button-use-my-location">
+                    <LocateFixed size={14} />{geoState === "locating" ? "Locating…" : "Use my location"}
+                  </button>
+                </div>
+                <div className="help-text">{lookupMessage || "Searches OpenStreetMap for a street or landmark."}</div>
+
+                <ReportLocationMap
+                  latitude={latitude}
+                  longitude={longitude}
+                  onChange={(nextLat, nextLng) => { setCoordinates(nextLat, nextLng); setGeoState("manual"); }}
+                />
+
+                <div className="coordinates">
+                  <div>
+                    <span>Latitude / longitude</span>
+                    <b>
+                      <input value={latitude} onChange={(event) => setLatitude(event.target.value)} aria-label="Latitude" data-testid="input-report-latitude" />
+                      <input value={longitude} onChange={(event) => setLongitude(event.target.value)} aria-label="Longitude" data-testid="input-report-longitude" />
+                    </b>
+                  </div>
+                  <div>
+                    <span>Source and accuracy</span>
+                    <b>
+                      {geoState === "locating" && "asking the device…"}
+                      {geoState === "ready" && `device gps${accuracy ? ` (±${Math.round(accuracy)} m)` : ""}`}
+                      {geoState === "exif" && "photo gps tag"}
+                      {geoState === "manual" && "placed by hand"}
+                      {geoState === "blocked" && "unavailable — drag the pin"}
+                    </b>
+                  </div>
+                  <div>
+                    <span>Land classification</span>
+                    <b>{land ? (land.land_class || "unknown").replace("_", " ") : "checking…"}</b>
+                  </div>
+                </div>
+
+                {geoState === "ready" && accuracy > 100 && (
+                  <div className="help-text">
+                    That is a rough fix — laptops guess from WiFi and IP. Drag the pin onto the real spot before filing.
+                  </div>
+                )}
+
+                {land && (
+                  <div className={`land-note land-${land.land_class}`} data-testid="text-land-class">
+                    {land.land_class === "public" && <><ShieldCheck size={14} /><span><strong>Public land.</strong> {land.land_note}</span></>}
+                    {land.land_class === "private" && (
+                      <>
+                        <AlertTriangle size={14} />
+                        <span>
+                          <strong>This looks like private property.</strong> {land.land_note}{" "}
+                          The register covers roads, footpaths, drains and public spaces. Map data is not
+                          perfect though — if this really is a public spot, you can file it anyway and the
+                          ward office will see that you confirmed it.
+                          {acceptPrivate ? (
+                            <span className="private-ack" data-testid="text-private-confirmed">
+                              <Check size={13} /> Filing anyway. This will be flagged for the ward office.{" "}
+                              <button type="button" className="quiet-button" onClick={() => setAcceptPrivate(false)} data-testid="button-undo-private">Undo</button>
+                            </span>
+                          ) : (
+                            <span className="private-choice">
+                              <button type="button" className="button secondary" onClick={() => setAcceptPrivate(true)} data-testid="button-continue-private">
+                                Yes, continue anyway
+                              </button>
+                              <button type="button" className="quiet-button" onClick={() => { setGeoState("manual"); setToast("Drag the pin to the public road or footpath."); }} data-testid="button-move-pin">
+                                Move the pin instead
+                              </button>
+                            </span>
+                          )}
+                        </span>
+                      </>
+                    )}
+                    {land.land_class === "unknown" && <><CircleHelp size={14} /><span>{land.land_note}</span></>}
+                  </div>
+                )}
+              </section>
+            )}
+
+            <div className="wizard-actions">
+              {step > 1
+                ? <button className="button secondary" onClick={() => setStep(step - 1)} data-testid="button-wizard-back">Back</button>
+                : <Link href="/map" className="button secondary">Cancel</Link>}
+              {step < 5 ? (
+                <button className="button amber" onClick={() => setStep(step + 1)} data-testid="button-wizard-next">
+                  Next <ArrowRight size={15} />
+                </button>
+              ) : (
+                <button className="button amber" disabled={blocked || submitting} onClick={() => submitReport(false)} data-testid="button-submit-report">
+                  {submitting ? "Checking nearby reports…" : "File this report"} <ArrowUpRight size={15} />
+                </button>
+              )}
             </div>
-            <div className="form-actions">
-              <div className="evidence-checklist" data-testid="list-evidence-checklist">
-                <span className={mediaFile && (!policy.require_geotag || exifInfo?.hasGps) ? "done" : ""}>
-                  {mediaFile && (!policy.require_geotag || exifInfo?.hasGps) ? "✓" : "○"} {policy.require_geotag ? "Geotagged photo" : "Photo"}
-                </span>
-                {policy.require_video && (
-                  <span className={videoFile ? "done" : ""}>{videoFile ? "✓" : "○"} Video clip</span>
-                )}
-                <span className={description.trim().length >= 10 ? "done" : ""}>{description.trim().length >= 10 ? "✓" : "○"} Description</span>
-                {land?.land_class === "private" && (
-                  <span className={acceptPrivate ? "done" : "warn"}>{acceptPrivate ? "✓" : "!"} Private land confirmed</span>
-                )}
-              </div>
-              <Link href="/map" className="button button-secondary" data-testid="link-cancel-report">Cancel</Link><button className="button button-primary" disabled={
-                  !description.trim() || submitting || !mediaFile
-                  || (policy.require_geotag && !exifInfo?.hasGps)
-                  || (policy.require_video && !videoFile)
-                  || (land?.land_class === "private" && land?.enforced && !acceptPrivate)
-                  || (policy.require_geotag && exifInfo?.gap != null && exifInfo.gap > (policy.max_exif_drift_m || 2000))
-                  || (policy.max_photo_age_hours > 0 && exifInfo?.ageHours != null && exifInfo.ageHours > policy.max_photo_age_hours)
-                } onClick={() => submitReport(false)} data-testid="button-submit-report">{submitting ? "Checking nearby reports…" : "Review and file report"}<ArrowRight size={15} /></button></div>
-          </section>
-          <aside className="panel info-panel"><div className="eyebrow">How CivicFix works</div><h3 style={{ marginTop: 7 }}>From street view to ward action</h3><div style={{ marginTop: 20 }}><div className="process-step"><div className="step-number">01</div><div><strong>Describe the street problem</strong><p>Use a landmark and a plain-language description.</p></div></div><div className="process-step"><div className="step-number">02</div><div><strong>Check for duplicates</strong><p>We look within 50 metres before creating a new entry.</p></div></div><div className="process-step"><div className="step-number">03</div><div><strong>Track accountable action</strong><p>The ward office updates the status as work moves forward.</p></div></div></div><div className="auth-note" style={{ marginTop: 3 }}><ShieldCheck size={15} style={{ verticalAlign: "-3px", marginRight: 5 }} />Your report is visible to residents in this ward.</div></aside>
+          </div>
+
+          <aside className="checklist" data-testid="list-evidence-checklist">
+            <h3>Filing checklist</h3>
+            <ul>
+              {checklist.map(([item, done, isBlocked]) => (
+                <li key={item} className={done ? "done" : isBlocked ? "blocked" : ""}>
+                  <i>{done ? "✓" : isBlocked ? "!" : "•"}</i>{item}
+                </li>
+              ))}
+            </ul>
+            <div className="estimated">
+              <span>Estimated score</span>
+              <strong>{severity * 10}</strong>
+              <small>({severity} × 10, before any backing)</small>
+            </div>
+            <div className="privacy-note">
+              <LockKeyhole size={16} />
+              <span>Your report is visible to residents in this ward. Your email address is not.</span>
+            </div>
+          </aside>
         </div>
-      </div>
+      </main>
+
       {nearby.length > 0 && <DuplicateModal nearby={nearby} onClose={() => { setNearby([]); setSubmitting(false); }} onSupport={supportAndGo} onCreateNew={() => submitReport(true)} />}
       {toast && <div className="toast" role="status" data-testid="toast-report">{toast}</div>}
     </AppShell>
+  );
+}
+
+/* --------------------------------------------------------- my reports */
+
+function ReportCard({ issue, onSelect, testid }) {
+  return (
+    <button className="report-card" onClick={() => onSelect(issue)} data-testid={testid}>
+      <Thumb issue={issue} />
+      <div>
+        <div className="row-top" style={{ flexDirection: "row", justifyContent: "flex-start" }}>
+          <Badge tone={issue.status}>{STATUS_LABELS[issue.status]}</Badge>
+          <span>{issueRef(issue)} · {formatShortDate(issue.created_at)}</span>
+        </div>
+        <h3>{issue.description}</h3>
+        <p>{CATEGORY_LABELS[issue.category]} · {issue.upvotes} backing{issue.upvotes === 1 ? "" : "s"} · {communityStanding(issue).label}</p>
+      </div>
+      <Score score={issue.priority_score} small />
+    </button>
   );
 }
 
@@ -933,30 +1434,84 @@ function MyReportsPage() {
   const { issues: allIssues, refresh: refreshAll } = useIssueFeed();
   const [selected, setSelected] = useState(null);
   const [toast, setToast] = useToast();
-  const [me, setMe] = useState({ name: "", id: null });
-  useEffect(() => { getCurrentUser().then(setMe).catch(() => {}); }, []);
+  const me = useMe();
   const backedIssues = allIssues.filter((issue) => issue.backed_by_me && issue.user_id !== me.id);
   const handleUpvote = async (id) => { await upvoteIssue(id); await Promise.all([refresh(), refreshAll()]); setToast("Your backing has been recorded."); };
+
   return (
-    <AppShell title="My reports">
-      <div className="page">
-        <PageHeader eyebrow="Resident activity" title="Your reports, in the open." description="Follow what you raised, see resident backing, and keep the ward office accountable to a visible status." action={<Link href="/report" className="button button-amber" data-testid="link-report-from-my-reports"><FilePlus2 size={15} />New report</Link>} />
-        <div className="stat-grid">
-          <div className="stat-card featured"><div className="stat-label">Reports filed</div><div className="stat-value">{issues.length}</div><div className="stat-meta">in the civic register</div></div>
-          <div className="stat-card"><div className="stat-label">Issues backed</div><div className="stat-value">{backedIssues.length}</div><div className="stat-meta">reports you support</div></div>
-          <div className="stat-card"><div className="stat-label">Receiving action</div><div className="stat-value">{issues.filter((issue) => issue.status === "in_progress").length}</div><div className="stat-meta">currently in progress</div></div>
-          <div className="stat-card"><div className="stat-label">Resolved</div><div className="stat-value band-amber">{issues.filter((issue) => issue.status === "resolved").length}</div><div className="stat-meta">closed by ward office</div></div>
+    <AppShell>
+      <main className="content-page">
+        <div className="page-intro">
+          <div>
+            <p className="eyebrow">Your activity</p>
+            <h1>My reports</h1>
+            <p>What you have filed, and what you have backed for other residents.</p>
+          </div>
+          <Link href="/report" className="button amber" data-testid="link-report-from-my-reports">
+            <Plus size={17} /> Report issue
+          </Link>
         </div>
-        <section className="panel"><div className="panel-header"><div><h2>Filed by {me.name || "you"}</h2><p>Most recent entries first</p></div><button className="quiet-button" onClick={() => { refresh(); refreshAll(); }} data-testid="button-refresh-my-reports"><Activity size={14} />Refresh</button></div>{isLoading ? <LoadingPanel rows={3} /> : error ? <ErrorPanel onRetry={refresh} /> : issues.length ? <div className="my-reports-grid" style={{ padding: 13 }}>{issues.map((issue) => <button className="report-card" key={issue.id} onClick={() => setSelected(issue)} style={{ textAlign: "left" }} data-testid={`card-my-report-${issue.id}`}><div className="report-card-head"><div><div className="eyebrow">{issue.id} · {formatShortDate(issue.created_at)}</div><h3 style={{ marginTop: 8 }}>{CATEGORY_LABELS[issue.category]}</h3></div><Score score={issue.priority_score} /></div><p>{issue.description}</p><div className="report-card-foot"><StatusChip status={issue.status} /><span>{issue.upvotes} resident backings</span></div></button>)}</div> : <div className="empty-state" data-testid="state-empty-my-reports"><FilePlus2 size={28} /><strong>No reports yet</strong><p>When you spot something that needs action, it will appear here.</p><Link href="/report" className="button button-amber" style={{ marginTop: 16 }} data-testid="link-first-report">File your first report</Link></div>}</section>
-        <section className="panel" style={{ marginTop: 15 }}><div className="panel-header"><div><h2>Backed by you</h2><p>Existing reports you have supported</p></div><ThumbsUp size={16} color="var(--muted)" /></div>{backedIssues.length ? <div className="my-reports-grid" style={{ padding: 13 }}>{backedIssues.map((issue) => <button className="report-card" key={issue.id} onClick={() => setSelected(issue)} style={{ textAlign: "left" }} data-testid={`card-backed-report-${issue.id}`}><div className="report-card-head"><div><div className="eyebrow">{issue.id} · {formatShortDate(issue.created_at)}</div><h3 style={{ marginTop: 8 }}>{CATEGORY_LABELS[issue.category]}</h3></div><Score score={issue.priority_score} /></div><p>{issue.description}</p><div className="report-card-foot"><StatusChip status={issue.status} /><span>{issue.upvotes} resident backings</span></div></button>)}</div> : <div className="empty-state"><ThumbsUp size={26} /><strong>No backed reports yet</strong><p>Back a nearby issue from the map to keep it visible here.</p><Link href="/map" className="button button-secondary" style={{ marginTop: 16 }}>Browse the ward map</Link></div>}</section>
-      </div>
+
+        <div className="stat-strip">
+          <div><span>Filed by you</span><strong>{issues.length}</strong><small>on the ward register</small></div>
+          <div><span>Backed by you</span><strong>{backedIssues.length}</strong><small>other residents' reports</small></div>
+          <div><span>Receiving action</span><strong>{issues.filter((issue) => issue.status === "in_progress").length}</strong><small>work is underway</small></div>
+          <div><span>Resolved</span><strong className="green">{issues.filter((issue) => issue.status === "resolved").length}</strong><small>closed by the ward office</small></div>
+        </div>
+
+        <div className="section-head" style={{ marginBottom: 12 }}>
+          <div>
+            <h1 style={{ fontSize: 18 }}>Filed by {me.name || "you"}</h1>
+            <p className="help-text">Most recent entries first</p>
+          </div>
+          <button className="filter-button" onClick={() => { refresh(); refreshAll(); }} data-testid="button-refresh-my-reports">
+            <Activity size={14} />Refresh
+          </button>
+        </div>
+
+        {isLoading ? <LoadingPanel rows={3} /> : error ? <ErrorPanel onRetry={refresh} /> : issues.length ? (
+          <div className="reports-list">
+            {issues.map((issue) => <ReportCard key={issue.id} issue={issue} onSelect={setSelected} testid={`card-my-report-${issue.id}`} />)}
+          </div>
+        ) : (
+          <div className="empty-state" data-testid="state-empty-my-reports">
+            <Flag size={28} />
+            <strong>No reports yet</strong>
+            <p>When you spot something that needs action, it will appear here.</p>
+            <Link href="/report" className="button amber" data-testid="link-first-report">File your first report</Link>
+          </div>
+        )}
+
+        <div className="section-head" style={{ margin: "30px 0 12px" }}>
+          <div>
+            <h1 style={{ fontSize: 18 }}>Backed by you</h1>
+            <p className="help-text">Existing reports you have supported</p>
+          </div>
+        </div>
+
+        {backedIssues.length ? (
+          <div className="reports-list">
+            {backedIssues.map((issue) => <ReportCard key={issue.id} issue={issue} onSelect={setSelected} testid={`card-backed-report-${issue.id}`} />)}
+          </div>
+        ) : (
+          <div className="empty-state">
+            <ThumbsUp size={26} />
+            <strong>No backed reports yet</strong>
+            <p>Back a nearby issue from the map to keep it visible here.</p>
+            <Link href="/map" className="button secondary">Browse the ward map</Link>
+          </div>
+        )}
+      </main>
+
       <IssueDetailModal issue={selected} onClose={() => setSelected(null)} onUpvote={handleUpvote} />
       {toast && <div className="toast" role="status" data-testid="toast-my-reports">{toast}</div>}
     </AppShell>
   );
 }
 
-function DirectionsModal({ issue, onClose, onStatus }) {
+/* --------------------------------------------------------- directions */
+
+function DirectionsView({ issue, onClose, onStatus, canSignOff = true }) {
   const mapNode = useRef(null);
   const mapRef = useRef(null);
   useMapAutosize(mapRef, mapNode);
@@ -987,9 +1542,10 @@ function DirectionsModal({ issue, onClose, onStatus }) {
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       attribution: "© OpenStreetMap · routing by OSRM", maxZoom: 19
     }).addTo(map);
-    L.marker(destination, { icon: L.divIcon({ className: "",
-      html: `<div class="marker-pin" style="background:#b7473f"><span>${issue.priority_score}</span></div>`,
-      iconSize: [26, 26], iconAnchor: [13, 26] }) }).addTo(map).bindTooltip(CATEGORY_LABELS[issue.category]);
+    L.marker(destination, { icon: L.divIcon({
+      className: `map-pin ${scoreTone(issue.priority_score)}`,
+      html: `<span>${issue.priority_score}</span>`,
+      iconSize: [38, 38], iconAnchor: [19, 19] }) }).addTo(map).bindTooltip(CATEGORY_LABELS[issue.category]);
     mapRef.current = map;
     const timer = window.setTimeout(() => map.invalidateSize(), 90);
     return () => { window.clearTimeout(timer); map.remove(); mapRef.current = null; };
@@ -1011,7 +1567,7 @@ function DirectionsModal({ issue, onClose, onStatus }) {
       if (!map) return;
       if (lineRef.current) map.removeLayer(lineRef.current);
       lineRef.current = L.polyline(result.geometry.coordinates.map((c) => [c[1], c[0]]), {
-        color: "#11243b", weight: 5, opacity: .85, dashArray: result.approximate ? "8 8" : null
+        color: "#10243e", weight: 5, opacity: .85, dashArray: result.approximate ? "8 8" : null
       }).addTo(map);
       map.fitBounds(lineRef.current.getBounds(), { padding: [45, 45] });
     });
@@ -1033,100 +1589,253 @@ function DirectionsModal({ issue, onClose, onStatus }) {
     + `&destination=${destination[0]},${destination[1]}&travelmode=driving`;
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onClose} data-testid="modal-directions">
-      <div className="modal-card modal-wide" onClick={(event) => event.stopPropagation()}>
-        <div className="modal-head">
-          <div>
-            <div className="eyebrow">Route to issue</div>
-            <h3>{CATEGORY_LABELS[issue.category]}</h3>
-            <p className="subhead">{issue.id} · {locationLabel(issue)}</p>
+    <div className="directions-overlay" role="dialog" aria-modal="true" data-testid="modal-directions">
+      <div className="directions-map">
+        <div ref={mapNode} data-testid="map-directions" />
+        <button className="back-floating" onClick={onClose} data-testid="button-close-directions">
+          <ArrowLeft size={17} /> Back to the desk
+        </button>
+        {route && (
+          <div className="route-summary" data-testid="text-route-summary">
+            <div>
+              <p className="eyebrow">Route to {issueRef(issue)}</p>
+              <h2>{formatMins(route.duration)} <span>·</span> {formatKm(route.distance)}</h2>
+              <p>Arriving about {new Intl.DateTimeFormat("en-IN", { hour: "2-digit", minute: "2-digit" }).format(new Date(Date.now() + route.duration * 1000))}</p>
+            </div>
+            <div className="route-icon"><Navigation size={20} /></div>
           </div>
-          <button className="icon-button" onClick={onClose} aria-label="Close directions" data-testid="button-close-directions"><X size={16} /></button>
-        </div>
-
-        <div className="directions-body">
-          <div className="directions-map"><div ref={mapNode} data-testid="map-directions" /></div>
-
-          <div className="directions-side">
-            {state === "blocked" && <div className="auth-note">Your browser would not share a location, so a route cannot be drawn. Open the issue in a maps app instead.</div>}
-            {state === "locating" && <div className="help-text">Finding your position…</div>}
-
-            {route && (
-              <>
-                <div className="route-summary" data-testid="text-route-summary">
-                  <strong>{formatMins(route.duration)}</strong>
-                  <span>{formatKm(route.distance)} by road</span>
-                  <span>Arriving about {new Intl.DateTimeFormat("en-IN", { hour: "2-digit", minute: "2-digit" }).format(new Date(Date.now() + route.duration * 1000))}</span>
-                </div>
-                {route.approximate && <div className="help-text">Road routing is unreachable, so this is a straight-line estimate at 25 km/h. The distance and bearing are still right.</div>}
-                {remaining !== null && remaining < 60 && <div className="help-text"><strong>You have arrived</strong> — within {Math.round(remaining)} m of the reported spot.</div>}
-
-                <div className="route-actions">
-                  <button type="button" className="button button-secondary" onClick={() => setFollow(!follow)} data-testid="button-follow-location">
-                    <Navigation size={14} />{follow ? "Stop following" : "Follow my location"}
-                  </button>
-                  <a className="button button-secondary" href={mapsUrl} target="_blank" rel="noopener noreferrer" data-testid="link-open-maps">
-                    <ArrowRight size={14} />Open in Maps
-                  </a>
-                </div>
-
-                <div className="route-actions">
-                  {issue.status !== "in_progress" && <button type="button" className="button button-primary" onClick={() => onStatus(issue.id, "in_progress")} data-testid="button-route-in-progress">Mark in progress</button>}
-                  {issue.status !== "resolved" && <button type="button" className="button button-secondary" onClick={() => onStatus(issue.id, "resolved")} data-testid="button-route-resolved">Mark resolved</button>}
-                </div>
-
-                {steps.length > 0 && (
-                  <ol className="route-steps" data-testid="list-route-steps">
-                    {steps.map((step, index) => (
-                      <li key={index}><span>{stepInstruction(step)}</span><b>{step.distance > 5 ? formatKm(step.distance) : ""}</b></li>
-                    ))}
-                  </ol>
-                )}
-              </>
-            )}
-          </div>
-        </div>
+        )}
       </div>
+
+      <aside className="directions-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Ward response</p>
+            <h2>{CATEGORY_LABELS[issue.category]}</h2>
+            <p className="help-text">{issueRef(issue)} · {locationLabel(issue)}</p>
+          </div>
+          <Score score={issue.priority_score} />
+        </div>
+
+        {state === "blocked" && <div className="route-note">Your browser would not share a location, so a route cannot be drawn. Open the issue in a maps app instead.</div>}
+        {state === "locating" && <div className="route-note">Finding your position…</div>}
+        {route?.approximate && <div className="route-note">Road routing is unreachable, so this is a straight-line estimate at 25 km/h. The distance and bearing are still right.</div>}
+        {remaining !== null && remaining < 60 && <div className="route-note arrived"><strong>You have arrived</strong> — within {Math.round(remaining)} m of the reported spot.</div>}
+
+        <div className="route-actions">
+          <button type="button" className="button secondary" onClick={() => setFollow(!follow)} data-testid="button-follow-location">
+            <Navigation size={14} />{follow ? "Stop following" : "Follow my location"}
+          </button>
+          <a className="button secondary" href={mapsUrl} target="_blank" rel="noopener noreferrer" data-testid="link-open-maps">
+            <ArrowUpRight size={14} />Open in Maps
+          </a>
+        </div>
+
+        {steps.length > 0 && (
+          <ol className="route-steps" data-testid="list-route-steps">
+            {steps.map((step, index) => (
+              <li key={index}>
+                <b>{index + 1}</b>
+                <span>
+                  <strong>{stepInstruction(step)}</strong>
+                  {step.distance > 5 && <small>{formatKm(step.distance)}</small>}
+                </span>
+              </li>
+            ))}
+          </ol>
+        )}
+
+        <div className="panel-footer">
+          {!canSignOff && (
+            <div className="route-note">You filed this report, so another administrator has to update its status.</div>
+          )}
+          {canSignOff && issue.status !== "in_progress" && (
+            <button type="button" className="button secondary" onClick={() => onStatus(issue.id, "in_progress")} data-testid="button-route-in-progress">
+              Mark in progress
+            </button>
+          )}
+          {canSignOff && issue.status !== "resolved" && (
+            <button type="button" className="button amber" onClick={() => onStatus(issue.id, "resolved")} data-testid="button-route-resolved">
+              <Check size={16} />Mark resolved
+            </button>
+          )}
+        </div>
+      </aside>
     </div>
   );
 }
 
+/* -------------------------------------------------------------- ward desk */
+
 function AdminPage() {
   const { issues, isLoading, error, refresh } = useIssueFeed();
+  const me = useMe();
   const [toast, setToast] = useToast();
   const [adminSearch, setAdminSearch] = useState("");
   const [routing, setRouting] = useState(null);
   const [adminCategory, setAdminCategory] = useState("all");
   const [adminStatus, setAdminStatus] = useState("all");
-  const handleStatus = async (id, status) => { await updateIssueStatus(id, status); await refresh(); setToast(`Status updated to ${STATUS_LABELS[status].toLowerCase()}.`); };
+
+  const handleStatus = async (id, status) => {
+    try {
+      await updateIssueStatus(id, status);
+      await refresh();
+      setToast(`Status updated to ${STATUS_LABELS[status].toLowerCase()}.`);
+    } catch (err) {
+      setToast(err.message);
+    }
+  };
   const counts = Object.keys(CATEGORY_LABELS).map((category) => ({ category, count: issues.filter((issue) => issue.category === category).length }));
   const maxCount = Math.max(...counts.map((item) => item.count), 1);
-  const filteredIssues = useMemo(() => issues.filter((issue) => (adminCategory === "all" || issue.category === adminCategory) && (adminStatus === "all" || issue.status === adminStatus) && `${issue.id} ${issue.description} ${issue.reporter} ${locationLabel(issue)}`.toLowerCase().includes(adminSearch.toLowerCase())).sort((a, b) => b.priority_score - a.priority_score), [issues, adminCategory, adminStatus, adminSearch]);
+  const filteredIssues = useMemo(() => issues
+    .filter((issue) =>
+      (adminCategory === "all" || issue.category === adminCategory) &&
+      (adminStatus === "all" || issue.status === adminStatus) &&
+      `${issue.id} ${issue.description} ${issue.reporter} ${locationLabel(issue)}`.toLowerCase().includes(adminSearch.toLowerCase()))
+    .sort((a, b) => b.priority_score - a.priority_score),
+    [issues, adminCategory, adminStatus, adminSearch]);
+
   return (
-    <AppShell title="Ward office" eyebrow="Triage console">
-      <div className="page">
-        <PageHeader eyebrow="Civic register" title="Turn reports into action." description="Triage the resident register by priority, then leave a clear status trail for the people who raised it." action={<button className="button button-secondary" onClick={refresh} data-testid="button-refresh-admin"><Activity size={15} />Refresh register</button>} />
-        <div className="stat-grid">
-          <div className="stat-card featured"><div className="stat-label">Open workload</div><div className="stat-value">{issues.filter((issue) => issue.status !== "resolved").length}</div><div className="stat-meta">reports needing ward attention</div></div>
-          <div className="stat-card"><div className="stat-label">Pending review</div><div className="stat-value">{issues.filter((issue) => issue.status === "pending").length}</div><div className="stat-meta">new resident entries</div></div>
-          <div className="stat-card"><div className="stat-label">In progress</div><div className="stat-value">{issues.filter((issue) => issue.status === "in_progress").length}</div><div className="stat-meta">with an active action</div></div>
-          <div className="stat-card"><div className="stat-label">Closed</div><div className="stat-value band-amber">{issues.filter((issue) => issue.status === "resolved").length}</div><div className="stat-meta">marked resolved</div></div>
+    <AppShell>
+      <main className="content-page admin-page">
+        <div className="page-intro">
+          <div>
+            <p className="eyebrow">Operations</p>
+            <h1>Ward priority desk</h1>
+            <p>Triage the resident register by priority, then leave a status trail the reporter can see.</p>
+          </div>
+          <button className="button secondary" onClick={refresh} data-testid="button-refresh-admin">
+            <Activity size={15} />Refresh register
+          </button>
         </div>
+
+        <div className="stat-strip">
+          <div><span>Open workload</span><strong>{issues.filter((issue) => issue.status !== "resolved").length}</strong><small>needing ward attention</small></div>
+          <div><span>Pending review</span><strong>{issues.filter((issue) => issue.status === "pending").length}</strong><small>new resident entries</small></div>
+          <div><span>In progress</span><strong>{issues.filter((issue) => issue.status === "in_progress").length}</strong><small>with an active action</small></div>
+          <div><span>Resolved</span><strong className="green">{issues.filter((issue) => issue.status === "resolved").length}</strong><small>closed on the register</small></div>
+        </div>
+
         <div className="admin-grid">
-          <section className="panel"><div className="panel-header"><div><h2>Priority triage</h2><p>Change a status to publish an accountable update.</p></div><span className="eyebrow">{filteredIssues.length} of {issues.length} records</span></div><div className="admin-filters"><div className="admin-search"><Search size={14} /><input value={adminSearch} onChange={(event) => setAdminSearch(event.target.value)} placeholder="Search ID, reporter or place" data-testid="input-admin-search" /></div><select className="filter-select" value={adminCategory} onChange={(event) => setAdminCategory(event.target.value)} data-testid="select-admin-category"><option value="all">All categories</option>{Object.entries(CATEGORY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><select className="filter-select" value={adminStatus} onChange={(event) => setAdminStatus(event.target.value)} data-testid="select-admin-status"><option value="all">All statuses</option>{Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>{isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filteredIssues.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>Photo</th><th>Issue</th><th>Priority</th><th>Filed</th><th>Evidence</th><th>Verified</th><th>Route</th><th>Status workflow</th></tr></thead><tbody>{filteredIssues.map((issue) => <tr key={issue.id} className={`row-standing-${communityStanding(issue).key}`} data-testid={`row-issue-${issue.id}`}><td>{issue.photo_url ? (issue.media_type === "video" ? <video className="photo-thumb" src={issue.photo_url} muted data-testid={`video-thumb-${issue.id}`} /> : <img className="photo-thumb" src={issue.photo_url} alt={`Evidence for ${issue.id}`} data-testid={`photo-thumb-${issue.id}`} />) : <div className="photo-thumb photo-thumb-empty" data-testid={`photo-thumb-empty-${issue.id}`}><CloudUpload size={14} /></div>}</td><td><div className="table-title">{CATEGORY_LABELS[issue.category]}</div><div className="table-sub">{issue.id} · {locationLabel(issue)}</div></td><td><Score score={issue.priority_score} /></td><td><div className="table-sub">{formatDate(issue.created_at)}</div><div className="table-sub">{issue.reporter}</div></td><td>{issue.geo_source === "exif" && <div className="prov-tag prov-good" data-testid={`prov-exif-${issue.id}`}>photo GPS</div>}{issue.land_class === "private" && <div className="prov-tag prov-bad" title={issue.private_ack ? "The reporter was warned and filed anyway" : ""}>private land{issue.private_ack ? " · confirmed" : ""}</div>}{issue.land_class === "public" && <div className="prov-tag prov-good">public land</div>}{issue.video_url && <div className="prov-tag">video</div>}</td><td>{(() => { const st = communityStanding(issue);
-  if (st.key === "unchecked") return <span className="table-sub">not checked yet</span>;
-  return <div className={`trust-inline trust-${st.key}`} data-testid={`trust-cell-${issue.id}`}>
-    <strong>{st.key === "verified" ? "✓ Verified" : st.key === "disputed" ? "Disputed" : `${st.confirmed}/${VERIFIED_AT}`}</strong>
-    <span>{st.confirmed} yes · {st.disputed} no</span>
-  </div>;
-})()}</td><td><button type="button" className="quiet-button" onClick={() => setRouting(issue)} data-testid={`button-route-${issue.id}`}><Navigation size={13} />Directions</button></td><td><select className="filter-select status-select" value={issue.status} onChange={(event) => handleStatus(issue.id, event.target.value)} data-testid={`select-status-${issue.id}`}><option value="pending">Pending review</option><option value="in_progress">In progress</option><option value="resolved">Resolved</option></select></td></tr>)}</tbody></table></div> : <div className="empty-state" data-testid="state-empty-admin"><Search size={26} /><strong>No matching register entries</strong><p>Adjust the search or filters to widen the triage view.</p></div>}</section>
-          <aside className="panel"><div className="panel-header"><div><h2>Register shape</h2><p>Reports by category</p></div><SlidersHorizontal size={16} color="var(--muted)" /></div><div className="bar-list">{counts.map(({ category, count }) => <div className="bar-item" key={category}><span>{CATEGORY_LABELS[category]}</span><div className="bar-track"><div className="bar-fill" style={{ width: `${(count / maxCount) * 100}%` }} /></div><strong>{count}</strong></div>)}</div><div className="panel-body" style={{ borderTop: "1px solid var(--line)" }}><div className="eyebrow">Service signal</div><div className="metric-list"><div className="metric-row"><span>Average priority</span><strong>{issues.length ? Math.round(issues.reduce((sum, issue) => sum + issue.priority_score, 0) / issues.length) : 0}</strong></div><div className="metric-row"><span>Resident backing</span><strong>{issues.reduce((sum, issue) => sum + issue.upvotes, 0)}</strong></div><div className="metric-row"><span>Resolution rate</span><strong>{issues.length ? `${Math.round((issues.filter((issue) => issue.status === "resolved").length / issues.length) * 100)}%` : "0%"}</strong></div></div></div></aside>
+          <div className="table-card">
+            <div className="table-toolbar">
+              <div className="search-input">
+                <Search size={17} />
+                <input value={adminSearch} onChange={(event) => setAdminSearch(event.target.value)} placeholder="Search ID, reporter or place" data-testid="input-admin-search" />
+              </div>
+              <select className="filter-select" value={adminCategory} onChange={(event) => setAdminCategory(event.target.value)} data-testid="select-admin-category">
+                <option value="all">All categories</option>
+                {Object.entries(CATEGORY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+              <select className="filter-select" value={adminStatus} onChange={(event) => setAdminStatus(event.target.value)} data-testid="select-admin-status">
+                <option value="all">All statuses</option>
+                {Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </div>
+
+            {isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filteredIssues.length ? (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Report</th><th>Category</th><th>Priority</th><th>Filed</th>
+                      <th>Evidence</th><th>Verification</th><th>Status</th><th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredIssues.map((issue) => {
+                      const standing = communityStanding(issue);
+                      return (
+                        <tr key={issue.id} data-testid={`row-issue-${issue.id}`}>
+                          <td>
+                            <div className="table-report">
+                              <Thumb issue={issue} />
+                              <div>
+                                <strong>{issueRef(issue)}</strong>
+                                <span>{issue.description}</span>
+                              </div>
+                            </div>
+                          </td>
+                          <td>{CATEGORY_LABELS[issue.category]}<br /><span className="help-text">{locationLabel(issue)}</span></td>
+                          <td><Score score={issue.priority_score} small /></td>
+                          <td>{formatDate(issue.created_at)}<br /><span className="help-text">{issue.reporter}</span></td>
+                          <td>
+                            {issue.geo_source === "exif" && <div className="prov-tag prov-good" data-testid={`prov-exif-${issue.id}`}>photo GPS</div>}
+                            {issue.land_class === "private" && <div className="prov-tag prov-bad" title={issue.private_ack ? "The reporter was warned and filed anyway" : ""}>private land{issue.private_ack ? " · confirmed" : ""}</div>}
+                            {issue.land_class === "public" && <div className="prov-tag prov-good">public land</div>}
+                            {issue.video_url && <div className="prov-tag">video</div>}
+                          </td>
+                          <td>
+                            {standing.key === "unchecked" ? <span className="help-text">not checked yet</span> : (
+                              <div className={`trust-inline trust-${standing.key}`} data-testid={`trust-cell-${issue.id}`}>
+                                <strong>{standing.key === "verified" ? "✓ Verified" : standing.key === "disputed" ? "Disputed" : `${standing.confirmed}/${VERIFIED_AT}`}</strong>
+                                <span>{standing.confirmed} yes · {standing.disputed} no</span>
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            <select
+                              value={issue.status}
+                              disabled={me.id != null && issue.user_id === me.id}
+                              title={me.id != null && issue.user_id === me.id ? "You filed this report, so another administrator has to update its status." : undefined}
+                              onChange={(event) => handleStatus(issue.id, event.target.value)}
+                              data-testid={`select-status-${issue.id}`}
+                            >
+                              <option value="pending">Pending review</option>
+                              <option value="in_progress">In progress</option>
+                              <option value="resolved">Resolved</option>
+                            </select>
+                            {me.id != null && issue.user_id === me.id && <span className="help-text">your report</span>}
+                          </td>
+                          <td>
+                            <button type="button" className="action-link" onClick={() => setRouting(issue)} data-testid={`button-route-${issue.id}`}>
+                              <Navigation size={15} />Directions
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state" data-testid="state-empty-admin">
+                <Search size={26} />
+                <strong>No matching register entries</strong>
+                <p>Adjust the search or filters to widen the triage view.</p>
+              </div>
+            )}
+          </div>
+
+          <aside className="side-card">
+            <div className="panel-heading">
+              <div><p className="eyebrow">Register shape</p><h2>Reports by category</h2></div>
+              <SlidersHorizontal size={16} color="var(--muted)" />
+            </div>
+            <div className="bar-list">
+              {counts.map(({ category, count }) => (
+                <div className="bar-item" key={category}>
+                  <span>{CATEGORY_LABELS[category]}</span>
+                  <div className="bar-track"><div className="bar-fill" style={{ width: `${(count / maxCount) * 100}%` }} /></div>
+                  <strong>{count}</strong>
+                </div>
+              ))}
+            </div>
+            <div style={{ borderTop: "1px solid var(--line)", padding: "14px 0" }}>
+              <p className="eyebrow" style={{ padding: "0 20px" }}>Service signal</p>
+              <div className="metric-row"><span>Average priority</span><strong>{issues.length ? Math.round(issues.reduce((sum, issue) => sum + issue.priority_score, 0) / issues.length) : 0}</strong></div>
+              <div className="metric-row"><span>Resident backing</span><strong>{issues.reduce((sum, issue) => sum + issue.upvotes, 0)}</strong></div>
+              <div className="metric-row"><span>Resolution rate</span><strong>{issues.length ? `${Math.round((issues.filter((issue) => issue.status === "resolved").length / issues.length) * 100)}%` : "0%"}</strong></div>
+            </div>
+          </aside>
         </div>
-      </div>
+      </main>
+
       {toast && <div className="toast" role="status" data-testid="toast-admin">{toast}</div>}
-          {routing && (
-        <DirectionsModal
+      {routing && (
+        <DirectionsView
           issue={routing}
+          canSignOff={!(me.id != null && routing.user_id === me.id)}
           onClose={() => setRouting(null)}
           onStatus={async (id, status) => { await handleStatus(id, status); setRouting(null); }}
         />
@@ -1134,6 +1843,8 @@ function AdminPage() {
     </AppShell>
   );
 }
+
+/* -------------------------------------------------------------- sign in */
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
@@ -1186,6 +1897,7 @@ function AuthPage() {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
   const submit = async (event) => {
     event.preventDefault();
     if (!email || !password || (mode === "register" && !name)) { setError("Fill in the fields above to continue."); return; }
@@ -1201,31 +1913,90 @@ function AuthPage() {
       setBusy(false);
     }
   };
+
   return (
     <div className="auth-page">
-      <section className="auth-aside"><Logo /><div className="auth-kicker">Public infrastructure, made legible</div><h1>Small reports.<br /><em>Visible action.</em></h1><p className="subhead">CivicFix connects a resident’s street view to the ward office responsible for fixing it.</p><div className="auth-footer">A shared register of street-level issues</div></section>
-      <section className="auth-form-side"><div className="auth-card"><div className="eyebrow">Resident access</div>
-        <GoogleButton
-          onError={setError}
-          onCredential={async (credential) => {
-            setBusy(true); setError("");
-            try { await signInWithGoogle(credential); setLocation("/map"); }
-            catch (err) { setError(err.message || "Google sign-in failed."); }
-            finally { setBusy(false); }
-          }}
-        /><h2>{mode === "signin" ? "Welcome back." : "Create your account."}</h2><p className="subhead">{mode === "signin" ? "Sign in to follow reports and back the issues your street needs fixed." : "Create a local account to file reports and keep a visible record of action."}</p><div className="auth-tabs"><button className={`auth-tab ${mode === "signin" ? "active" : ""}`} onClick={() => { setMode("signin"); setError(""); }} data-testid="button-auth-signin">Sign in</button><button className={`auth-tab ${mode === "register" ? "active" : ""}`} onClick={() => { setMode("register"); setError(""); }} data-testid="button-auth-register">Create account</button></div><form className="auth-form" onSubmit={submit}>{mode === "register" && <div className="field"><label htmlFor="auth-name">Full name</label><input id="auth-name" className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="Your full name" data-testid="input-auth-name" /></div>}<div className="field"><label htmlFor="auth-email">Email address</label><input id="auth-email" className="input" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" data-testid="input-auth-email" /></div><div className="field"><label htmlFor="auth-password">Password</label><input id="auth-password" className="input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" data-testid="input-auth-password" /></div>{error && <div className="auth-note" role="alert" data-testid="status-auth-error">{error}</div>}<button type="submit" className="button button-primary" disabled={busy} data-testid="button-submit-auth">{busy ? "Opening your register…" : mode === "signin" ? "Sign in to CivicFix" : "Create resident account"}<ArrowRight size={15} /></button></form><p className="auth-legal">By continuing, you agree that reports are visible to other residents nearby. This demo uses local mock data only; no account details leave this device.</p></div></section>
+      <section className="auth-aside">
+        <Brand tagline="Ward action register" />
+        <div className="auth-kicker">Public infrastructure, made legible</div>
+        <h1>Small reports.<br /><em>Visible action.</em></h1>
+        <p>CivicFix connects a resident’s street view to the ward office responsible for fixing it, and keeps the status trail in the open.</p>
+        <div className="auth-footer">A shared register of street-level issues</div>
+      </section>
+
+      <section className="auth-form-side">
+        <div className="auth-card">
+          <p className="eyebrow">Resident access</p>
+          <GoogleButton
+            onError={setError}
+            onCredential={async (credential) => {
+              setBusy(true); setError("");
+              try { await signInWithGoogle(credential); setLocation("/map"); }
+              catch (err) { setError(err.message || "Google sign-in failed."); }
+              finally { setBusy(false); }
+            }}
+          />
+          <h2>{mode === "signin" ? "Welcome back." : "Create your account."}</h2>
+          <p>{mode === "signin"
+            ? "Sign in to follow reports and back the issues your street needs fixed."
+            : "Create a local account to file reports and keep a visible record of action."}</p>
+
+          <div className="auth-tabs">
+            <button className={`auth-tab${mode === "signin" ? " active" : ""}`} onClick={() => { setMode("signin"); setError(""); }} data-testid="button-auth-signin">Sign in</button>
+            <button className={`auth-tab${mode === "register" ? " active" : ""}`} onClick={() => { setMode("register"); setError(""); }} data-testid="button-auth-register">Create account</button>
+          </div>
+
+          <form className="auth-form" onSubmit={submit}>
+            {mode === "register" && (
+              <div className="field">
+                <label htmlFor="auth-name">Full name</label>
+                <input id="auth-name" className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="Your full name" data-testid="input-auth-name" />
+              </div>
+            )}
+            <div className="field">
+              <label htmlFor="auth-email">Email address</label>
+              <input id="auth-email" className="input" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" data-testid="input-auth-email" />
+            </div>
+            <div className="field">
+              <label htmlFor="auth-password">Password</label>
+              <input id="auth-password" className="input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" data-testid="input-auth-password" />
+            </div>
+            {error && <div className="auth-note" role="alert" data-testid="status-auth-error">{error}</div>}
+            <button type="submit" className="button amber" disabled={busy} data-testid="button-submit-auth">
+              {busy ? "Opening your register…" : mode === "signin" ? "Sign in to CivicFix" : "Create resident account"}
+              <ArrowRight size={15} />
+            </button>
+          </form>
+
+          <p className="auth-legal">By continuing, you agree that reports are visible to other residents nearby.</p>
+        </div>
+      </section>
     </div>
   );
 }
 
+/* --------------------------------------------------------------- routing */
+
 function RedirectMap() {
   const [, setLocation] = useLocation();
   useEffect(() => { setLocation("/map"); }, [setLocation]);
-  return <div className="loading-stack" style={{ minHeight: "100dvh" }}><div className="skeleton" style={{ width: 170, height: 28 }} /><div className="skeleton" style={{ width: "70%", height: 100 }} /></div>;
+  return (
+    <div className="loading-stack" style={{ minHeight: "100dvh" }}>
+      <div className="skeleton" style={{ width: 170, height: 28 }} />
+      <div className="skeleton" style={{ width: "70%", height: 100 }} />
+    </div>
+  );
 }
 
 function NotFoundPage() {
-  return <div className="empty-state" style={{ minHeight: "100dvh", display: "grid", placeItems: "center" }}><div><CircleHelp size={32} /><strong>That page is not in the register.</strong><p>Return to the issue map to continue.</p><Link href="/map" className="button button-primary" style={{ marginTop: 16 }} data-testid="link-not-found-map">Open issue map</Link></div></div>;
+  return (
+    <div className="empty-state" style={{ minHeight: "100dvh" }}>
+      <CircleHelp size={32} />
+      <strong>That page is not in the register.</strong>
+      <p>Return to the issue map to continue.</p>
+      <Link href="/map" className="button amber" data-testid="link-not-found-map">Open issue map</Link>
+    </div>
+  );
 }
 
 function Protected({ component: Component }) {

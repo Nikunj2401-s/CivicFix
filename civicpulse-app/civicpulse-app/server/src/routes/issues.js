@@ -8,6 +8,7 @@ import exifr from 'exifr';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
 import { reportLimiter, voteLimiter } from '../middleware/rateLimit.js';
 import { classifyLand } from '../lib/gis.js';
+import { storeUpload } from '../lib/storage.js';
 import { wrap, asId, asText, asEnum, asInt, asLatitude, asLongitude, badRequest, notFound, unprocessable } from '../lib/validate.js';
 
 const r = Router();
@@ -23,60 +24,22 @@ const MAX_EXIF_DRIFT_M = Number(process.env.MAX_EXIF_DRIFT_M || 2000);
 /* Freshness does the work the radius gave up. A picture of a pothole that was filled
    last year is useless to the ward office however close to it you are standing. */
 const MAX_PHOTO_AGE_HOURS = Number(process.env.MAX_PHOTO_AGE_HOURS || 24);
-/* A person can file this many reports in any rolling 24 hours. Counted in the
-   database rather than in memory, so it survives a restart and cannot be reset by
-   reconnecting from a different IP. */
-const DAILY_REPORT_QUOTA = Number(process.env.DAILY_REPORT_QUOTA || 5);
-
 const CATEGORIES = ['pothole', 'garbage', 'water_leakage', 'broken_streetlight', 'road_damage'];
 const STATUSES = ['pending', 'in_progress', 'resolved'];
 
-/* ---------- photo upload ---------- */
-const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
-
+/* ---------- evidence upload ----------
+   Memory storage rather than disk: storeUpload decides where the bytes end up, and
+   exifr can read a Buffer directly, so nothing has to touch the filesystem when the
+   destination is object storage. */
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadDir),
-    filename: (_req, file, cb) =>
-      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${path.extname(file.originalname).toLowerCase()}`)
-  }),
-  limits: { fileSize: 40 * 1024 * 1024 },   // videos need the headroom
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 40 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ok = file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/');
     if (!ok) return cb(new Error('Upload a photo or a video.'));
     cb(null, true);
   }
 });
-
-/* How much of the daily allowance this person has left, and when the oldest
-   report in the window ages out. A rolling window, not a midnight reset: filing
-   five at 11pm does not hand you five more an hour later. */
-async function reportQuota(userId) {
-  const { rows } = await q(
-    `SELECT count(*)::int AS used, min(created_at) AS oldest
-       FROM issues
-      WHERE user_id = $1 AND created_at > now() - interval '24 hours'`,
-    [userId]
-  );
-  const used = rows[0].used;
-  const oldest = rows[0].oldest;
-  return {
-    limit: DAILY_REPORT_QUOTA,
-    used,
-    remaining: Math.max(0, DAILY_REPORT_QUOTA - used),
-    resets_at: oldest ? new Date(new Date(oldest).getTime() + 24 * 3600 * 1000).toISOString() : null
-  };
-}
-
-/* Multer writes to disk before the handler runs, so a report we go on to refuse
-   would leave its photo and clip behind for good. Anything that leaves with an
-   error takes its uploads with it. */
-function discardUploads(files) {
-  for (const file of files) {
-    if (file?.path) fs.promises.unlink(file.path).catch(() => {});
-  }
-}
 
 /* one place that decides what an issue looks like over the wire */
 const SELECT = `
@@ -143,15 +106,9 @@ r.get('/policy', (req, res) => {
     require_public_land: REQUIRE_PUBLIC_LAND,
     max_photo_age_hours: MAX_PHOTO_AGE_HOURS,
     max_exif_drift_m: MAX_EXIF_DRIFT_M,
-    dupe_radius_m: DUPE_RADIUS_M,
-    daily_report_quota: DAILY_REPORT_QUOTA
+    dupe_radius_m: DUPE_RADIUS_M
   });
 });
-
-/* What the person filing has left today, so the form can say so before they start. */
-r.get('/quota', wrap(async (req, res) => {
-  res.json(await reportQuota(req.user.id));
-}));
 
 r.get('/mine', wrap(async (req, res) => {
   const { rows } = await q(
@@ -200,22 +157,15 @@ r.post('/', reportLimiter, evidence, wrap(async (req, res) => {
   const lng = asLongitude(req.body.longitude);
   const confirmed = req.body.confirm === 'true' || req.body.confirm === true;
 
-  /* Any exit that is not a success takes the uploaded files with it. Registered
-     here so it covers every rule below, thrown or returned alike. */
-  res.on('finish', () => {
-    if (res.statusCode >= 400) discardUploads([photoFile, videoFile]);
-  });
-
-  /* The daily allowance. Checked before any of the evidence work, so someone who
-     has run out is told immediately rather than after an EXIF parse and a GIS call. */
-  const quota = await reportQuota(req.user.id);
-  if (quota.remaining <= 0) {
-    const resets = new Date(quota.resets_at);
-    const hours = Math.max(1, Math.ceil((resets.getTime() - Date.now()) / 3600000));
-    return res.status(429).json({
-      error: `You have filed ${quota.used} reports in the last 24 hours, which is the limit. You can file again in about ${hours} hour${hours === 1 ? '' : 's'}. If something urgent needs attention now, back an existing report instead.`,
-      quota
-    });
+  if (!confirmed) {
+    const duplicates = await findNearby(req.user.id, category, exif_lat ?? lat, exif_lng ?? lng);
+    if (duplicates.length) {
+      return res.status(409).json({
+        error: 'Possible issue already reported nearby',
+        radius_m: DUPE_RADIUS_M,
+        duplicates
+      });
+    }
   }
 
   /* Evidence rules. A report has to carry a geotagged still and a clip, because a
@@ -226,8 +176,6 @@ r.post('/', reportLimiter, evidence, wrap(async (req, res) => {
   if (REQUIRE_VIDEO && !videoFile) throw unprocessable('A short video of the issue is required.');
   if (videoFile && !videoFile.mimetype.startsWith('video/')) throw unprocessable('The video field must hold a video.');
 
-  const photo_url = `/uploads/${photoFile.filename}`;
-  const video_url = videoFile ? `/uploads/${videoFile.filename}` : null;
   const media_type = videoFile ? 'video' : 'photo';
 
   /* A photo may carry its own GPS tag. We never reject a file for lacking one —
@@ -240,7 +188,7 @@ r.post('/', reportLimiter, evidence, wrap(async (req, res) => {
   /* Two calls on purpose. exifr's `pick` filters the whole result, so asking for
      DateTimeOriginal in the same call as gps silently drops latitude and longitude. */
   try {
-    const gps = await exifr.gps(photoFile.path);
+    const gps = await exifr.gps(photoFile.buffer);
     if (gps && Number.isFinite(gps.latitude) && Number.isFinite(gps.longitude)) {
       exif_lat = gps.latitude;
       exif_lng = gps.longitude;
@@ -250,7 +198,7 @@ r.post('/', reportLimiter, evidence, wrap(async (req, res) => {
   } catch { /* unreadable or absent EXIF is normal, not an error */ }
 
   try {
-    const times = await exifr.parse(photoFile.path, { pick: ['DateTimeOriginal', 'CreateDate'] });
+    const times = await exifr.parse(photoFile.buffer, { pick: ['DateTimeOriginal', 'CreateDate'] });
     const shot = times?.DateTimeOriginal || times?.CreateDate;
     if (shot) photo_taken_at = new Date(shot);
   } catch { /* no timestamp is not evidence of anything */ }
@@ -280,19 +228,6 @@ r.post('/', reportLimiter, evidence, wrap(async (req, res) => {
   /* Where the camera says it stood beats where the form says the pin is. */
   const finalLat = exif_lat ?? lat;
   const finalLng = exif_lng ?? lng;
-
-  /* The 50 m duplicate sweep, against the coordinate we are actually going to file.
-     It has to run after the EXIF pass, because that is what settles the coordinate. */
-  if (!confirmed) {
-    const duplicates = await findNearby(req.user.id, category, finalLat, finalLng);
-    if (duplicates.length) {
-      return res.status(409).json({
-        error: 'Possible issue already reported nearby',
-        radius_m: DUPE_RADIUS_M,
-        duplicates
-      });
-    }
-  }
 
   /* The device's own reading, sent alongside, is a second independent witness.
      If the photo was taken somewhere else entirely, these two disagree — which is
@@ -331,6 +266,12 @@ r.post('/', reportLimiter, evidence, wrap(async (req, res) => {
       land_note: land.land_note
     });
   }
+  /* Upload last. Everything above can reject the report, and there is no sense paying
+     for storage — or leaving orphans in it — for a report that never existed. */
+  const stored = await storeUpload(photoFile);
+  const photo_url = stored.url;
+  const video_url = videoFile ? (await storeUpload(videoFile)).url : null;
+
   const { rows } = await q(
     `INSERT INTO issues (user_id, photo_url, category, description, severity, latitude, longitude,
                          media_type, geo_source, exif_lat, exif_lng, exif_drift_m, video_url,
@@ -342,25 +283,17 @@ r.post('/', reportLimiter, evidence, wrap(async (req, res) => {
      photo_taken_at && !Number.isNaN(photo_taken_at.getTime()) ? photo_taken_at : null,
      land.land_class === 'private' && acknowledgedPrivate]
   );
-  /* The reporter is not counted as a supporter of their own report. Priority is
-     meant to measure how many *other* residents feel the same problem, and a maker
-     who also backs and verifies their own entry is the whole thing the separation
-     of maker and checker exists to prevent. A new report therefore starts at
-     severity x 10, and every point above that came from somebody else. */
+  // the person filing it is its first supporter
+  await q('INSERT INTO issue_upvotes (issue_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [rows[0].id, req.user.id]);
   const created = await q(`${SELECT} WHERE i.id = $2`, [req.user.id, rows[0].id]);
-  res.status(201).json({ ...created.rows[0], quota: await reportQuota(req.user.id) });
+  res.status(201).json(created.rows[0]);
 }));
 
 /* community upvotes */
 r.post('/:id/upvote', voteLimiter, wrap(async (req, res) => {
   const id = asId(req.params.id);
-  const owner = await q('SELECT user_id FROM issues WHERE id = $1', [id]);
-  if (!owner.rowCount) throw notFound('That report no longer exists.');
-  /* Same separation the verify route enforces: the person who raised a report
-     does not get to inflate its priority by backing it. */
-  if (owner.rows[0].user_id === req.user.id) {
-    return res.status(403).json({ error: 'You cannot back your own report. Its priority comes from other residents.' });
-  }
+  const exists = await q('SELECT 1 FROM issues WHERE id = $1', [id]);
+  if (!exists.rowCount) throw notFound('That report no longer exists.');
   const ins = await q(
     'INSERT INTO issue_upvotes (issue_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING issue_id',
     [id, req.user.id]
@@ -407,19 +340,6 @@ r.delete('/:id/verify', wrap(async (req, res) => {
 r.patch('/:id/status', requireAdmin, wrap(async (req, res) => {
   const id = asId(req.params.id);
   const status = asEnum(req.body.status, STATUSES, 'Status');
-
-  /* The last leg of maker and checker. An administrator who files a report is its
-     maker, and cannot then sign off their own work — marking it resolved is the
-     strongest claim the system makes, so it has to come from a second person.
-     Set ALLOW_SELF_SIGNOFF=true only for a single-account demo. */
-  const owner = await q('SELECT user_id FROM issues WHERE id = $1', [id]);
-  if (!owner.rowCount) throw notFound('That report no longer exists.');
-  if (owner.rows[0].user_id === req.user.id && process.env.ALLOW_SELF_SIGNOFF !== 'true') {
-    return res.status(403).json({
-      error: 'You filed this report, so another administrator has to update its status.'
-    });
-  }
-
   const upd = await q('UPDATE issues SET status = $1 WHERE id = $2 RETURNING id', [status, id]);
   if (!upd.rowCount) throw notFound('That report no longer exists.');
   await q('UPDATE status_history SET changed_by = $1 WHERE id = (SELECT max(id) FROM status_history WHERE issue_id = $2)', [req.user.id, id]);
