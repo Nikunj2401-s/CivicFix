@@ -891,7 +891,10 @@ function ReportPage() {
   const [land, setLand] = useState(null);
   const [acceptPrivate, setAcceptPrivate] = useState(false);
   const [policy, setPolicy] = useState({
-    require_geotag: true, require_video: true, require_public_land: true, max_photo_age_hours: 24
+    /* Permissive until the server answers. If /policy is unreachable the form would
+       otherwise enforce rules the server may not have, and the submit button stays dead
+       with nothing on screen explaining why. */
+    require_geotag: false, require_video: false, require_public_land: false, max_photo_age_hours: 0
   });
   useEffect(() => { getPolicy().then(setPolicy).catch(() => {}); }, []);
   const [quota, setQuota] = useState(null);
@@ -1032,6 +1035,20 @@ function ReportPage() {
   const freshOk = !(policy.max_photo_age_hours > 0 && exifInfo?.ageHours != null && exifInfo.ageHours > policy.max_photo_age_hours);
   const quotaOk = !quota || quota.remaining > 0;
   const blocked = !photoOk || !videoOk || !descriptionOk || !landOk || !driftOk || !freshOk || !latitude || !longitude || !quotaOk;
+
+  /* A disabled button with no explanation is the worst possible state, so name the first
+     unmet requirement. */
+  const blocker =
+    !mediaFile ? "Add a photo before filing."
+    : !photoOk ? "That photo carries no location tag, and the geotag rule is switched on."
+    : !videoOk ? "A short video is required."
+    : !descriptionOk ? `The description needs at least 10 characters — ${description.trim().length} so far.`
+    : !latitude || !longitude ? "Set the location pin."
+    : !landOk ? "Confirm that this private-looking location really is public right of way."
+    : !driftOk ? "The photo was taken too far from where you are now."
+    : !freshOk ? "The photo is older than the allowed limit."
+    : !quotaOk ? "You have used your report allowance for today."
+    : null;
 
   const checklist = [
     ["Photo evidence", photoOk, !mediaFile ? null : !photoOk],

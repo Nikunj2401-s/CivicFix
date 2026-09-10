@@ -6,7 +6,19 @@
  * data to real requests. Vite proxies /api and /uploads to localhost:4000.
  */
 
+/* Empty in development: Vite proxies /api to the server, so a relative path works and
+   there is no origin to configure. In a deployed build the API is on its own domain and
+   VITE_API_URL names it. */
+const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+
 const TOKEN_KEY = 'civicfix.token';
+
+/** Photos are absolute Cloudinary URLs when hosted, and /uploads paths when local. */
+export function assetUrl(url) {
+  if (!url) return '';
+  if (/^https?:\/\//.test(url)) return url;
+  return `${API_BASE}${url}`;
+}
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY);
 export const setToken = (t) => (t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY));
@@ -29,7 +41,7 @@ async function request(path, { method = 'GET', body, form } = {}) {
 
   let res;
   try {
-    res = await fetch(`/api${path}`, {
+    res = await fetch(`${API_BASE}/api${path}`, {
       method,
       headers,
       body: form ? form : body ? JSON.stringify(body) : undefined
@@ -108,11 +120,6 @@ export async function checkLand(latitude, longitude) {
 /** What the server will actually enforce, so the form can match it. */
 export async function getPolicy() {
   return request('/issues/policy');
-}
-
-/** How many reports this account has left in the rolling 24-hour window. */
-export async function getReportQuota() {
-  return request('/issues/quota');
 }
 
 export async function getIssue(id) {

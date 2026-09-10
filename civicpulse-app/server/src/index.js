@@ -15,9 +15,22 @@ if (!process.env.DATABASE_URL || !process.env.JWT_SECRET) {
 const app = express();
 const dir = path.dirname(fileURLToPath(import.meta.url));
 
-app.use(cors());
+/* In development the client is proxied through Vite and shares the origin, so CORS never
+   comes up. Once deployed the client is on a different domain and has to be named — an
+   open policy would let any site on the internet call this API with a user's token. */
+const allowedOrigins = (process.env.CLIENT_ORIGIN || '')
+  .split(',').map((o) => o.trim()).filter(Boolean);
+
+app.use(cors({
+  origin: allowedOrigins.length
+    ? (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin))
+    : true,
+  credentials: false
+}));
 app.use(express.json({ limit: '1mb' }));       // reports upload as multipart, not JSON
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
+/* Only meaningful when files are on this machine. With Cloudinary configured the
+   database holds absolute URLs and nothing is served from here. */
 app.use('/uploads', express.static(path.join(dir, 'uploads')));
 
 // behind a reverse proxy (nginx, Render, Railway) this makes req.ip the real client
@@ -80,8 +93,13 @@ process.on('uncaughtException', (error) => {
   console.error('Uncaught exception:', error);
 });
 
+/* Hosts assign the port; they do not ask. */
 const port = process.env.PORT || 4000;
-const server = app.listen(port, () => console.log(`CivicFix API on http://localhost:${port}`));
+const server = app.listen(port, '0.0.0.0', () => {
+  console.log(`CivicFix API listening on ${port}`);
+  console.log(`  storage : ${process.env.CLOUDINARY_URL ? 'Cloudinary' : 'local disk'}`);
+  console.log(`  origins : ${allowedOrigins.length ? allowedOrigins.join(', ') : 'any (development)'}`);
+});
 
 /* Finish in-flight requests before exiting, so nothing is half-written. */
 for (const signal of ['SIGINT', 'SIGTERM']) {
