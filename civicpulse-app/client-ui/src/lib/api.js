@@ -13,27 +13,76 @@ export const setToken = (t) => (t ? localStorage.setItem(TOKEN_KEY, t) : localSt
 export const isAuthed = () => Boolean(getToken());
 export const signOut = () => setToken(null);
 
+/* Everything the app knows about talking to the server. Errors are turned into
+   sentences a person can act on here, so no screen has to interpret a status code. */
 async function request(path, { method = 'GET', body, form } = {}) {
   const headers = {};
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body) headers['Content-Type'] = 'application/json';
 
-  const res = await fetch(`/api${path}`, {
-    method,
-    headers,
-    body: form ? form : body ? JSON.stringify(body) : undefined
-  });
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    const offline = new Error('You appear to be offline. Check your connection and try again.');
+    offline.status = 0;
+    throw offline;
+  }
 
-  const data = await res.json().catch(() => ({}));
+  let res;
+  try {
+    res = await fetch(`/api${path}`, {
+      method,
+      headers,
+      body: form ? form : body ? JSON.stringify(body) : undefined
+    });
+  } catch {
+    // the request never reached the server: no network, or the API is not running
+    const down = new Error('Could not reach the server. Is the API running on port 4000?');
+    down.status = 0;
+    throw down;
+  }
+
+  // a proxy or crash can return HTML where JSON was expected
+  const raw = await res.text();
+  let data = {};
+  if (raw) {
+    try { data = JSON.parse(raw); }
+    catch {
+      if (!res.ok) {
+        const broken = new Error(`The server returned an unexpected response (${res.status}).`);
+        broken.status = res.status;
+        throw broken;
+      }
+    }
+  }
+
   if (!res.ok) {
-    const err = new Error(data.error || `Request failed (${res.status})`);
+    const err = new Error(data.error || defaultMessage(res.status));
     err.status = res.status;
     err.data = data;
-    if (res.status === 401) setToken(null);
+    if (res.status === 401) {
+      setToken(null);
+      // let the shell notice and send the person back to sign in
+      window.dispatchEvent(new CustomEvent('civicfix:signed-out'));
+    }
     throw err;
   }
   return data;
+}
+
+function defaultMessage(status) {
+  switch (status) {
+    case 400: return 'Something in that request was not valid.';
+    case 401: return 'Your session has expired. Sign in again.';
+    case 403: return 'You do not have permission to do that.';
+    case 404: return 'That could not be found.';
+    case 409: return 'That conflicts with something already recorded.';
+    case 413: return 'That file is too large.';
+    case 415: return 'That file type is not accepted.';
+    case 422: return 'That report did not meet the evidence rules.';
+    case 429: return 'Too many requests in a short time. Wait a minute and try again.';
+    case 503: return 'The service is temporarily unavailable. Try again shortly.';
+    default:  return status >= 500 ? 'Something went wrong on the server.' : `Request failed (${status}).`;
+  }
 }
 
 /* ------------------------------------------------------------------ issues */
@@ -56,6 +105,11 @@ export async function checkLand(latitude, longitude) {
   return request('/issues/check-land', { method: 'POST', body: { latitude, longitude } });
 }
 
+/** What the server will actually enforce, so the form can match it. */
+export async function getPolicy() {
+  return request('/issues/policy');
+}
+
 export async function getIssue(id) {
   return request(`/issues/${id}`);
 }
@@ -73,6 +127,7 @@ export async function createIssue(input) {
   form.append('longitude', String(input.longitude));
   form.append('confirm', 'true');            // the UI already ran its own nearby check
   if (input.pinned_by_hand) form.append('pinned_by_hand', 'true');
+  if (input.accept_private) form.append('accept_private', 'true');
   if (input.device_lat != null) form.append('device_lat', String(input.device_lat));
   if (input.device_lng != null) form.append('device_lng', String(input.device_lng));
 

@@ -16,7 +16,8 @@ const app = express();
 const dir = path.dirname(fileURLToPath(import.meta.url));
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));       // reports upload as multipart, not JSON
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use('/uploads', express.static(path.join(dir, 'uploads')));
 
 // behind a reverse proxy (nginx, Render, Railway) this makes req.ip the real client
@@ -27,11 +28,66 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/issues', issueRoutes);
 
+/* An unknown path under /api should answer in JSON, not with Express's HTML page —
+   the client parses every response as JSON and would choke on markup. */
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: `No endpoint at ${req.method} ${req.originalUrl}.` });
+});
+
+/* One place where every failure becomes a response the client can show a person. */
 app.use((err, _req, res, _next) => {
-  console.error(err);
-  if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'That photo is over 8 MB.' });
-  res.status(500).json({ error: err.message || 'Something went wrong on the server.' });
+  // thrown deliberately by the validators
+  if (err.status && err.status < 500) {
+    return res.status(err.status).json({ error: err.message, ...err.extra });
+  }
+
+  // multer
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'That file is too large. The limit is 40 MB.' });
+  }
+  if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+    return res.status(400).json({ error: `Unexpected file field "${err.field}".` });
+  }
+  if (err.message === 'Upload a photo or a video.') {
+    return res.status(415).json({ error: err.message });
+  }
+
+  // postgres, translated into something a person can act on
+  switch (err.code) {
+    case '23505': return res.status(409).json({ error: 'That already exists.' });
+    case '23503': return res.status(409).json({ error: 'That refers to something which no longer exists.' });
+    case '23514': return res.status(422).json({ error: 'One of those values is not allowed.' });
+    case '22P02': return res.status(400).json({ error: 'One of those values was the wrong type.' });
+    case '23502': return res.status(422).json({ error: 'A required field was missing.' });
+    case 'ECONNREFUSED':
+    case '57P01':
+      console.error('Database unreachable:', err.message);
+      return res.status(503).json({ error: 'The database is unavailable. Try again in a moment.' });
+    default: break;
+  }
+
+  // anything left is genuinely ours, and the detail stays in the log
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Something went wrong on the server.' });
+});
+
+/* A rejected promise outside a request used to take the process down mid-response,
+   which the browser saw as a dropped connection with no explanation. Log and carry on. */
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
 });
 
 const port = process.env.PORT || 4000;
-app.listen(port, () => console.log(`CivicFix API on http://localhost:${port}`));
+const server = app.listen(port, () => console.log(`CivicFix API on http://localhost:${port}`));
+
+/* Finish in-flight requests before exiting, so nothing is half-written. */
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    console.log('\nShutting down…');
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 5000).unref();
+  });
+}

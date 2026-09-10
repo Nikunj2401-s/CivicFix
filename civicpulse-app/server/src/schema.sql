@@ -69,6 +69,12 @@ ALTER TABLE issues ADD COLUMN IF NOT EXISTS land_note  text;
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS device_lat double precision;
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS device_lng double precision;
 
+-- when the camera says the picture was taken
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS photo_taken_at timestamptz;
+
+-- the reporter was warned this looked like private land and chose to file anyway
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS private_ack boolean NOT NULL DEFAULT false;
+
 -- community verification: residents confirm or dispute that the issue is really there
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS confirmations integer NOT NULL DEFAULT 0;
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS disputes      integer NOT NULL DEFAULT 0;

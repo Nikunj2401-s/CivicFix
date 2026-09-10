@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { q } from '../db.js';
 import { sign, requireAuth, requireAdmin } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rateLimit.js';
+import { wrap, asText, asEmail, asLatitude, asLongitude, badRequest, notFound } from '../lib/validate.js';
 import { OAuth2Client } from 'google-auth-library';
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
@@ -19,12 +20,10 @@ const shape = (u) => ({
     : null
 });
 
-r.post('/register', authLimiter, async (req, res) => {
-  const name = (req.body.name || '').trim();
-  const email = (req.body.email || '').trim().toLowerCase();
-  const password = req.body.password || '';
-  if (!name || !email || !password) return res.status(400).json({ error: 'Name, email and password are all required.' });
-  if (password.length < 6) return res.status(400).json({ error: 'Use a password of at least 6 characters.' });
+r.post('/register', authLimiter, wrap(async (req, res) => {
+  const name = asText(req.body.name, 'Name', { min: 2, max: 80 });
+  const email = asEmail(req.body.email);
+  const password = asText(req.body.password, 'Password', { min: 6, max: 200, trim: false });
 
   const exists = await q('SELECT 1 FROM users WHERE email = $1', [email]);
   if (exists.rowCount) return res.status(409).json({ error: 'That email is already registered. Sign in instead.' });
@@ -35,10 +34,10 @@ r.post('/register', authLimiter, async (req, res) => {
     [name, email, hash]
   );
   res.status(201).json({ token: sign(rows[0]), user: shape(rows[0]) });
-});
+}));
 
-r.post('/login', authLimiter, async (req, res) => {
-  const email = (req.body.email || '').trim().toLowerCase();
+r.post('/login', authLimiter, wrap(async (req, res) => {
+  const email = asEmail(req.body.email);
   const { rows } = await q('SELECT * FROM users WHERE email = $1', [email]);
   const user = rows[0];
   if (user && !user.password_hash) {
@@ -47,11 +46,11 @@ r.post('/login', authLimiter, async (req, res) => {
   const ok = user && (await bcrypt.compare(req.body.password || '', user.password_hash));
   if (!ok) return res.status(401).json({ error: 'Email or password is wrong.' });
   res.json({ token: sign(user), user: shape(user) });
-});
+}));
 
-r.get('/me', requireAuth, async (req, res) => {
+r.get('/me', requireAuth, wrap(async (req, res) => {
   const { rows } = await q('SELECT * FROM users WHERE id = $1', [req.user.id]);
-  if (!rows[0]) return res.status(404).json({ error: 'Account not found.' });
+  if (!rows[0]) throw notFound('Account not found.');
   const stats = await q(
     `SELECT
        (SELECT count(*) FROM issues WHERE user_id = $1)                         AS reported,
@@ -61,26 +60,24 @@ r.get('/me', requireAuth, async (req, res) => {
     [req.user.id]
   );
   res.json({ user: shape(rows[0]), stats: stats.rows[0] });
-});
+}));
 
-r.patch('/me', requireAuth, async (req, res) => {
-  const name = (req.body.name || '').trim();
-  if (!name) return res.status(400).json({ error: 'Name cannot be empty.' });
+r.patch('/me', requireAuth, wrap(async (req, res) => {
+  const name = asText(req.body.name, 'Name', { min: 2, max: 80 });
   const { rows } = await q('UPDATE users SET name = $1 WHERE id = $2 RETURNING *', [name, req.user.id]);
   res.json({ user: shape(rows[0]) });
-});
+}));
 
 /* Google sign-in.
    The browser sends the ID token Google issued it; we verify that token against
    Google's keys rather than trusting anything the page tells us. A Google account
    always maps to a resident — the ward office signs in with a password, so an
    administrator can never be created by anyone who happens to own an address. */
-r.post('/google', authLimiter, async (req, res) => {
+r.post('/google', authLimiter, wrap(async (req, res) => {
   if (!googleClient) {
     return res.status(503).json({ error: 'Google sign-in is not configured on this server.' });
   }
-  const credential = req.body.credential;
-  if (!credential) return res.status(400).json({ error: 'No Google credential was sent.' });
+  const credential = asText(req.body.credential, 'Google credential', { min: 20, max: 4000 });
 
   let payload;
   try {
@@ -119,20 +116,18 @@ r.post('/google', authLimiter, async (req, res) => {
   }
 
   res.json({ token: sign(user), user: shape(user) });
-});
+}));
 
 /* where the crew starts from — admin only */
-r.patch('/office', requireAuth, requireAdmin, async (req, res) => {
-  const lat = Number(req.body.latitude), lng = Number(req.body.longitude);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    return res.status(400).json({ error: 'Give the office a latitude and longitude.' });
-  }
-  const label = (req.body.label || 'Ward office').trim().slice(0, 80);
+r.patch('/office', requireAuth, requireAdmin, wrap(async (req, res) => {
+  const lat = asLatitude(req.body.latitude);
+  const lng = asLongitude(req.body.longitude);
+  const label = asText(req.body.label || 'Ward office', 'Label', { max: 80 });
   const { rows } = await q(
     'UPDATE users SET office_lat = $1, office_lng = $2, office_label = $3 WHERE id = $4 RETURNING *',
     [lat, lng, label, req.user.id]
   );
   res.json({ user: shape(rows[0]) });
-});
+}));
 
 export default r;

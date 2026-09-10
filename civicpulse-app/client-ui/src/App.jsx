@@ -10,7 +10,7 @@ import {
   SlidersHorizontal, ThumbsUp, X,
 } from "lucide-react";
 import {
-  backIssue, checkLand, createIssue, verifyIssue, signInWithGoogle, findNearbyIssues, getCurrentUser, getIssues, getMyReports,
+  backIssue, checkLand, createIssue, verifyIssue, signInWithGoogle, getPolicy, findNearbyIssues, getCurrentUser, getIssues, getMyReports,
   distanceInMeters, register, signIn, updateIssueStatus, upvoteIssue, isAuthed, signOut,
 } from "./lib/api";
 
@@ -100,6 +100,66 @@ function stepInstruction(step) {
   }
 }
 
+/* Six independent residents confirming an issue is a different kind of fact from one
+   person reporting it. Past that line the report is treated as established rather than
+   claimed, and it is coloured differently everywhere it appears. */
+const VERIFIED_AT = 6;
+
+function communityStanding(issue) {
+  const confirmed = Number(issue?.confirmations || 0);
+  const disputed = Number(issue?.disputes || 0);
+  const checks = confirmed + disputed;
+
+  if (confirmed >= VERIFIED_AT && confirmed > disputed) {
+    return {
+      key: "verified", confirmed, disputed, checks,
+      label: "Community verified",
+      message: `Verified on the ground by ${confirmed} residents. This is no longer a single claim — the ward office can act on it.`
+    };
+  }
+  if (checks >= 3 && disputed > confirmed) {
+    return {
+      key: "disputed", confirmed, disputed, checks,
+      label: "Disputed",
+      message: `${disputed} residents could not find this issue. It may already have been fixed, or reported in the wrong place.`
+    };
+  }
+  if (checks > 0) {
+    return {
+      key: "checking", confirmed, disputed, checks,
+      label: `${confirmed}/${VERIFIED_AT} confirmed`,
+      message: `${confirmed} of the ${VERIFIED_AT} confirmations needed. ${VERIFIED_AT - confirmed} more and this becomes community verified.`
+    };
+  }
+  return { key: "unchecked", confirmed, disputed, checks, label: "Not yet checked", message: null };
+}
+
+/* Leaflet measures its container once, at creation. On a phone the layout is often
+   still settling at that moment — a drawer closing, the address bar collapsing, the
+   keyboard dismissing — and the map ends up blank or half-drawn. Watching the element
+   and re-measuring fixes it, and costs nothing when the size never changes. */
+function useMapAutosize(mapRef, hostRef) {
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return undefined;
+
+    const resize = () => mapRef.current?.invalidateSize({ animate: false });
+    const timers = [60, 250, 700].map((ms) => window.setTimeout(resize, ms));
+
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(resize) : null;
+    observer?.observe(host);
+    window.addEventListener("resize", resize);
+    window.addEventListener("orientationchange", resize);
+
+    return () => {
+      timers.forEach(window.clearTimeout);
+      observer?.disconnect();
+      window.removeEventListener("resize", resize);
+      window.removeEventListener("orientationchange", resize);
+    };
+  }, []);
+}
+
 function scoreBand(score) {
   if (score >= 65) return "red";
   if (score >= 40) return "amber";
@@ -176,10 +236,23 @@ function NavItem({ href, icon: Icon, label, current }) {
 function AppShell({ children, title, eyebrow = "Resident workspace" }) {
   const [location] = useLocation();
   const [user, setUser] = useState({ name: "", ward: "" });
+  const [drawerOpen, setDrawerOpen] = useState(false);
   useEffect(() => { getCurrentUser().then(setUser).catch(() => {}); }, []);
+
+  /* the drawer should never survive a navigation, and Escape should always close it */
+  useEffect(() => { setDrawerOpen(false); }, [location]);
+  useEffect(() => {
+    if (!drawerOpen) return undefined;
+    const onKey = (event) => { if (event.key === "Escape") setDrawerOpen(false); };
+    window.addEventListener("keydown", onKey);
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = ""; };
+  }, [drawerOpen]);
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      {drawerOpen && <div className="drawer-scrim" onClick={() => setDrawerOpen(false)} data-testid="drawer-scrim" />}
+      <aside className={`sidebar${drawerOpen ? " sidebar-open" : ""}`}>
+        <button className="drawer-close" onClick={() => setDrawerOpen(false)} aria-label="Close navigation" data-testid="button-close-navigation"><X size={16} /></button>
         <Logo />
         <div className="nav-label">Civic register</div>
         <nav className="nav-list" aria-label="Primary navigation">
@@ -203,7 +276,7 @@ function AppShell({ children, title, eyebrow = "Resident workspace" }) {
       <main className="main-column">
         <header className="topbar">
           <div style={{ display: "flex", alignItems: "center" }}>
-            <button className="icon-button mobile-menu" onClick={() => {}} aria-label="Open navigation" data-testid="button-open-navigation"><Menu size={17} /></button>
+            <button className="icon-button mobile-menu" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-expanded={drawerOpen} data-testid="button-open-navigation"><Menu size={17} /></button>
             <div><div className="topbar-kicker">{eyebrow}</div><div className="topbar-title">{title}</div></div>
           </div>
           <div className="topbar-actions">
@@ -246,10 +319,18 @@ function ErrorPanel({ onRetry }) {
 function IssueQueueCard({ issue, onSelect }) {
   const Icon = CATEGORY_ICONS[issue.category] || Flag;
   return (
-    <button className="queue-card" onClick={() => onSelect(issue)} data-testid={`card-issue-${issue.id}`}>
+    <button className={`queue-card standing-${communityStanding(issue).key}`} onClick={() => onSelect(issue)} data-testid={`card-issue-${issue.id}`}>
       <div className={`queue-stripe band-${scoreBand(issue.priority_score)}`} style={{ background: "currentColor" }} />
       <div>
-        <div className="queue-title"><Icon size={13} style={{ verticalAlign: "-2px", marginRight: 5 }} />{CATEGORY_LABELS[issue.category]}</div>
+        <div className="queue-title">
+          <Icon size={13} style={{ verticalAlign: "-2px", marginRight: 5 }} />{CATEGORY_LABELS[issue.category]}
+          {communityStanding(issue).key === "verified" && (
+            <span className="verified-chip" data-testid={`chip-verified-${issue.id}`}><ShieldCheck size={11} />Verified</span>
+          )}
+          {communityStanding(issue).key === "disputed" && (
+            <span className="disputed-chip" data-testid={`chip-disputed-${issue.id}`}><AlertTriangle size={11} />Disputed</span>
+          )}
+        </div>
         <div className="queue-location">{locationLabel(issue)}</div>
         <div className="queue-meta"><StatusChip status={issue.status} /><span>{issue.upvotes} backing{issue.upvotes === 1 ? "" : "s"}</span></div>
       </div>
@@ -342,6 +423,7 @@ function IssueDetailModal({ issue, onClose, onUpvote, canBack = true }) {
   const [isBacking, setIsBacking] = useState(false);
   const [backed, setBacked] = useState(issue?.backed_by_me);
   if (!issue) return null;
+  const standing = communityStanding(issue);
   const Icon = CATEGORY_ICONS[issue.category] || Flag;
   const handleBack = async () => {
     if (backed || isBacking) return;
@@ -352,7 +434,16 @@ function IssueDetailModal({ issue, onClose, onUpvote, canBack = true }) {
   };
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="issue-detail-title" data-testid="modal-issue-detail">
+      <section className={`modal standing-${standing.key}`} role="dialog" aria-modal="true" aria-labelledby="issue-detail-title" data-testid="modal-issue-detail">
+        {standing.message && (
+          <div className={`standing-banner banner-${standing.key}`} data-testid={`banner-standing-${issue.id}`}>
+            {standing.key === "verified" ? <ShieldCheck size={16} /> : standing.key === "disputed" ? <AlertTriangle size={16} /> : <CircleHelp size={16} />}
+            <div>
+              <strong>{standing.label}</strong>
+              <span>{standing.message}</span>
+            </div>
+          </div>
+        )}
         <div className="modal-head">
           <div><div className="eyebrow">{issue.id} · filed {formatDate(issue.created_at)}</div><h2 id="issue-detail-title"><Icon size={19} style={{ verticalAlign: "-3px", marginRight: 7 }} />{CATEGORY_LABELS[issue.category]}</h2></div>
           <button className="close-button" onClick={onClose} aria-label="Close issue detail" data-testid="button-close-issue-detail"><X size={18} /></button>
@@ -382,6 +473,7 @@ function IssueDetailModal({ issue, onClose, onUpvote, canBack = true }) {
 function MapCanvas({ issues, onSelect }) {
   const mapNode = useRef(null);
   const mapRef = useRef(null);
+  useMapAutosize(mapRef, mapNode);
   const markerLayerRef = useRef(null);
   const youLayerRef = useRef(null);
   const centredRef = useRef(false);
@@ -490,6 +582,7 @@ function ReportLocationMap({ latitude, longitude, onChange }) {
   const { position: myPosition } = useMyPosition();
   const mapNode = useRef(null);
   const mapRef = useRef(null);
+  useMapAutosize(mapRef, mapNode);
   const markerRef = useRef(null);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
@@ -547,6 +640,11 @@ function ReportPage() {
   const [videoName, setVideoName] = useState("");
   const [videoPreview, setVideoPreview] = useState("");
   const [land, setLand] = useState(null);
+  const [acceptPrivate, setAcceptPrivate] = useState(false);
+  const [policy, setPolicy] = useState({
+    require_geotag: true, require_video: true, require_public_land: true, max_photo_age_hours: 24
+  });
+  useEffect(() => { getPolicy().then(setPolicy).catch(() => {}); }, []);
   const [devicePos, setDevicePos] = useState(null);
   const [addressQuery, setAddressQuery] = useState("");
   const [lookupMessage, setLookupMessage] = useState("");
@@ -588,13 +686,18 @@ function ReportPage() {
     setExifInfo(null);
     if (isVideo) return;
     try {
-      const gps = await exifr.gps(file);
-      if (gps && Number.isFinite(gps.latitude)) {
+      /* Two calls on purpose: exifr's `pick` filters the whole result, so asking for
+         the timestamp in the same call as gps silently drops the coordinates. */
+      const gps = await exifr.gps(file).catch(() => null);
+      const times = await exifr.parse(file, { pick: ["DateTimeOriginal", "CreateDate"] }).catch(() => null);
+      const shot = times?.DateTimeOriginal || times?.CreateDate;
+      const ageHours = shot ? (Date.now() - new Date(shot).getTime()) / 3600000 : null;
+      if (gps && Number.isFinite(gps.latitude) && Number.isFinite(gps.longitude)) {
         const drift = latitude && longitude
           ? metresBetween([Number(latitude), Number(longitude)], [gps.latitude, gps.longitude])
           : null;
         const gap = devicePos ? metresBetween(devicePos, [gps.latitude, gps.longitude]) : null;
-        setExifInfo({ hasGps: true, latitude: gps.latitude, longitude: gps.longitude, drift, gap });
+        setExifInfo({ hasGps: true, latitude: gps.latitude, longitude: gps.longitude, drift, gap, ageHours });
         setCoordinates(gps.latitude, gps.longitude);   // the camera knows best
         setGeoState("exif");
       } else {
@@ -616,6 +719,7 @@ function ReportPage() {
     if (!latitude || !longitude) return undefined;
     let cancelled = false;
     setLand(null);
+    setAcceptPrivate(false);
     const timer = window.setTimeout(async () => {
       try {
         const result = await checkLand(Number(latitude), Number(longitude));
@@ -654,8 +758,8 @@ function ReportPage() {
       const matches = await findNearbyIssues(location.latitude, location.longitude, 50, category);
       if (matches.length) { setNearby(matches.map((issue) => ({ ...issue, distance_meters: distanceInMeters(location, issue) }))); setSubmitting(false); return; }
     }
-    await createIssue({ category, description: description.trim(), severity, latitude: location.latitude, longitude: location.longitude, photo_url: photoPreview, photo_file: mediaFile, video_file: videoFile, pinned_by_hand: geoState === "manual", device_lat: devicePos?.[0], device_lng: devicePos?.[1] });
-    setSubmitting(false); setNearby([]); setToast("Report added to the your ward register."); setDescription(""); setPhotoName(""); setPhotoPreview("");
+    await createIssue({ category, description: description.trim(), severity, latitude: location.latitude, longitude: location.longitude, photo_url: photoPreview, photo_file: mediaFile, video_file: videoFile, pinned_by_hand: geoState === "manual", accept_private: acceptPrivate, device_lat: devicePos?.[0], device_lng: devicePos?.[1] });
+    setSubmitting(false); setNearby([]); setToast("Report added to the the civic register."); setDescription(""); setPhotoName(""); setPhotoPreview("");
     window.setTimeout(() => setLocation("/my-reports"), 700);
   };
   const supportAndGo = async (issue) => { await backIssue(issue.id); setNearby([]); setSubmitting(false); setToast(`You backed ${issue.id}. No duplicate was filed.`); window.setTimeout(() => setLocation("/map"), 700); };
@@ -681,7 +785,31 @@ function ReportPage() {
                 {land && (
                   <div className={`land-note land-${land.land_class}`} data-testid="text-land-class">
                     {land.land_class === "public" && <><ShieldCheck size={14} /><span><strong>Public land.</strong> {land.land_note}</span></>}
-                    {land.land_class === "private" && <><AlertTriangle size={14} /><span><strong>This looks like private property.</strong> {land.land_note} The register covers roads, footpaths, drains and public spaces{land.enforced ? " — this report will be refused" : ""}.</span></>}
+                    {land.land_class === "private" && (
+                      <><AlertTriangle size={14} />
+                        <span>
+                          <strong>This looks like private property.</strong> {land.land_note}{" "}
+                          The register covers roads, footpaths, drains and public spaces. Map data is not
+                          perfect though — if this really is a public spot, you can file it anyway and the
+                          ward office will see that you confirmed it.
+                          {acceptPrivate ? (
+                            <span className="private-ack" data-testid="text-private-confirmed">
+                              <Check size={13} /> Filing anyway. This will be flagged for the ward office.{" "}
+                              <button type="button" className="quiet-button" onClick={() => setAcceptPrivate(false)} data-testid="button-undo-private">Undo</button>
+                            </span>
+                          ) : (
+                            <span className="private-choice">
+                              <button type="button" className="button button-secondary" onClick={() => setAcceptPrivate(true)} data-testid="button-continue-private">
+                                Yes, continue anyway
+                              </button>
+                              <button type="button" className="quiet-button" onClick={() => { setGeoState("manual"); setToast("Drag the pin to the public road or footpath."); }} data-testid="button-move-pin">
+                                Move the pin instead
+                              </button>
+                            </span>
+                          )}
+                        </span>
+                      </>
+                    )}
                     {land.land_class === "unknown" && <><CircleHelp size={14} /><span>{land.land_note}</span></>}
                   </div>
                 )}
@@ -695,7 +823,8 @@ function ReportPage() {
                   </button>
                   <div className="help-text" style={{ margin: 0 }}>
                     {geoState === "locating" && "Asking your device for a position…"}
-                    {geoState === "ready" && `GPS fix${accuracy ? ` · accurate to about ${Math.round(accuracy)} m` : ""}`}
+                    {geoState === "ready" && `GPS fix from your device${accuracy ? ` · accurate to about ${Math.round(accuracy)} m` : ""}`}
+                    {geoState === "exif" && "Location taken from the photo itself."}
                     {geoState === "manual" && "Pin set by hand. This is the spot that gets filed."}
                     {geoState === "blocked" && "Location unavailable. Drag the pin or search a landmark."}
                   </div>
@@ -709,7 +838,7 @@ function ReportPage() {
               <div className="field full"><ReportLocationMap latitude={latitude} longitude={longitude} onChange={(nextLat, nextLng) => { setCoordinates(nextLat, nextLng); setGeoState("manual"); }} /></div>
               <div className="field"><label htmlFor="report-latitude">Latitude</label><input id="report-latitude" className="input" value={latitude} onChange={(event) => setLatitude(event.target.value)} data-testid="input-report-latitude" /></div>
               <div className="field"><label htmlFor="report-longitude">Longitude</label><input id="report-longitude" className="input" value={longitude} onChange={(event) => setLongitude(event.target.value)} data-testid="input-report-longitude" /></div>
-              <div className="field full"><label>Photo evidence <span className="req-mark">geotagged, required</span></label><label className="upload-box" htmlFor="issue-photo">{photoPreview ? (mediaKind === "video" ? <video className="upload-preview" src={photoPreview} controls /> : <img className="upload-preview" src={photoPreview} alt="Selected street evidence preview" />) : <CloudUpload size={20} />}<strong>{photoName || "Add a street-level photo"}</strong><span className="help-text">Must carry a GPS tag — use your phone's camera app with location on</span><input id="issue-photo" type="file" accept="image/*" onChange={handleMedia} data-testid="input-report-photo" /></label>
+              <div className="field full"><label>Photo evidence <span className="req-mark">{policy.require_geotag ? "geotagged, required" : "required"}</span></label><label className="upload-box" htmlFor="issue-photo">{photoPreview ? (mediaKind === "video" ? <video className="upload-preview" src={photoPreview} controls /> : <img className="upload-preview" src={photoPreview} alt="Selected street evidence preview" />) : <CloudUpload size={20} />}<strong>{photoName || "Add a street-level photo"}</strong><span className="help-text">Must carry a GPS tag — use your phone's camera app with location on</span><input id="issue-photo" type="file" accept="image/*" onChange={handleMedia} data-testid="input-report-photo" /></label>
                 {exifInfo && (
                   <div className={`geo-tag-note ${exifInfo.hasGps ? "geo-ok" : "geo-bad"}`} data-testid="text-exif-status">
                     {exifInfo.hasGps ? (
@@ -717,29 +846,49 @@ function ReportPage() {
                         <strong>Location tag found.</strong> The camera recorded{" "}
                         <span className="mono">{exifInfo.latitude.toFixed(5)}, {exifInfo.longitude.toFixed(5)}</span>, and the
                         pin has been moved there. That coordinate is what gets filed.
-                        {exifInfo.gap !== null && exifInfo.gap > 150 && (
+                        {exifInfo.ageHours !== null && exifInfo.ageHours > 24 && (
+                          <div className="mismatch-alert" data-testid="text-photo-stale">
+                            <AlertTriangle size={14} />
+                            <span>
+                              <strong>This photo is {exifInfo.ageHours >= 48 ? `${Math.floor(exifInfo.ageHours / 24)} days` : `${Math.round(exifInfo.ageHours)} hours`} old.</strong>{" "}
+                              Reports need a recent picture — the ward office cannot act on something that may
+                              already have been fixed. Take a fresh photo of the issue.
+                            </span>
+                          </div>
+                        )}
+                        {exifInfo.gap !== null && exifInfo.gap > 2000 && (
                           <div className="mismatch-alert" data-testid="text-exif-mismatch">
                             <AlertTriangle size={14} />
                             <span>
                               <strong>The issue location is not where this photo was taken.</strong> The camera was
-                              {" "}{formatKm(exifInfo.gap)} from where your device says you are now. Report the issue from
-                              where it is, using a picture taken there — this report will be refused.
+                              {" "}{formatKm(exifInfo.gap)} from where you are now. Filing later from home is fine, but
+                              the photo has to be from the same area as the report — this one will be refused.
                             </span>
                           </div>
                         )}
                       </>
                     ) : (
                       <>
-                        <strong>This photo has no location tag, so it cannot be used.</strong> Take the picture
-                        with your phone's camera app with location switched on. Photos captured inside a browser,
-                        screenshots, and anything sent through WhatsApp have the tag stripped.
+                        {policy.require_geotag ? (
+                          <>
+                            <strong>This photo has no location tag, so it cannot be used.</strong> Android strips
+                            location from photos picked through a browser, so this often fails on a phone even when
+                            the picture does have one. Upload from a computer, or ask an administrator to relax the
+                            rule.
+                          </>
+                        ) : (
+                          <>
+                            <strong>No location tag on this photo.</strong> That is fine — the report will use your
+                            device's GPS instead, which is captured at the moment you file.
+                          </>
+                        )}
                       </>
                     )}
                   </div>
                 )}</div>
 
               <div className="field full">
-                <label>Video evidence <span className="req-mark">required</span></label>
+                <label>Video evidence <span className="req-mark">{policy.require_video ? "required" : "optional"}</span></label>
                 <label className="upload-box" htmlFor="issue-video">
                   {videoPreview ? <video className="upload-preview" src={videoPreview} controls /> : <CloudUpload size={20} />}
                   <strong>{videoName || "Add a short clip of the issue"}</strong>
@@ -750,11 +899,25 @@ function ReportPage() {
             </div>
             <div className="form-actions">
               <div className="evidence-checklist" data-testid="list-evidence-checklist">
-                <span className={mediaFile && exifInfo?.hasGps ? "done" : ""}>{mediaFile && exifInfo?.hasGps ? "✓" : "○"} Geotagged photo</span>
-                <span className={videoFile ? "done" : ""}>{videoFile ? "✓" : "○"} Video clip</span>
+                <span className={mediaFile && (!policy.require_geotag || exifInfo?.hasGps) ? "done" : ""}>
+                  {mediaFile && (!policy.require_geotag || exifInfo?.hasGps) ? "✓" : "○"} {policy.require_geotag ? "Geotagged photo" : "Photo"}
+                </span>
+                {policy.require_video && (
+                  <span className={videoFile ? "done" : ""}>{videoFile ? "✓" : "○"} Video clip</span>
+                )}
                 <span className={description.trim().length >= 10 ? "done" : ""}>{description.trim().length >= 10 ? "✓" : "○"} Description</span>
+                {land?.land_class === "private" && (
+                  <span className={acceptPrivate ? "done" : "warn"}>{acceptPrivate ? "✓" : "!"} Private land confirmed</span>
+                )}
               </div>
-              <Link href="/map" className="button button-secondary" data-testid="link-cancel-report">Cancel</Link><button className="button button-primary" disabled={!description.trim() || submitting || !mediaFile || !exifInfo?.hasGps || !videoFile || (land?.land_class === "private" && land?.enforced) || (exifInfo?.gap !== null && exifInfo?.gap > 150)} onClick={() => submitReport(false)} data-testid="button-submit-report">{submitting ? "Checking nearby reports…" : "Review and file report"}<ArrowRight size={15} /></button></div>
+              <Link href="/map" className="button button-secondary" data-testid="link-cancel-report">Cancel</Link><button className="button button-primary" disabled={
+                  !description.trim() || submitting || !mediaFile
+                  || (policy.require_geotag && !exifInfo?.hasGps)
+                  || (policy.require_video && !videoFile)
+                  || (land?.land_class === "private" && land?.enforced && !acceptPrivate)
+                  || (policy.require_geotag && exifInfo?.gap != null && exifInfo.gap > (policy.max_exif_drift_m || 2000))
+                  || (policy.max_photo_age_hours > 0 && exifInfo?.ageHours != null && exifInfo.ageHours > policy.max_photo_age_hours)
+                } onClick={() => submitReport(false)} data-testid="button-submit-report">{submitting ? "Checking nearby reports…" : "Review and file report"}<ArrowRight size={15} /></button></div>
           </section>
           <aside className="panel info-panel"><div className="eyebrow">How CivicFix works</div><h3 style={{ marginTop: 7 }}>From street view to ward action</h3><div style={{ marginTop: 20 }}><div className="process-step"><div className="step-number">01</div><div><strong>Describe the street problem</strong><p>Use a landmark and a plain-language description.</p></div></div><div className="process-step"><div className="step-number">02</div><div><strong>Check for duplicates</strong><p>We look within 50 metres before creating a new entry.</p></div></div><div className="process-step"><div className="step-number">03</div><div><strong>Track accountable action</strong><p>The ward office updates the status as work moves forward.</p></div></div></div><div className="auth-note" style={{ marginTop: 3 }}><ShieldCheck size={15} style={{ verticalAlign: "-3px", marginRight: 5 }} />Your report is visible to residents in this ward.</div></aside>
         </div>
@@ -770,19 +933,21 @@ function MyReportsPage() {
   const { issues: allIssues, refresh: refreshAll } = useIssueFeed();
   const [selected, setSelected] = useState(null);
   const [toast, setToast] = useToast();
-  const backedIssues = allIssues.filter((issue) => issue.backed_by_me && issue.user_id !== "usr-01");
+  const [me, setMe] = useState({ name: "", id: null });
+  useEffect(() => { getCurrentUser().then(setMe).catch(() => {}); }, []);
+  const backedIssues = allIssues.filter((issue) => issue.backed_by_me && issue.user_id !== me.id);
   const handleUpvote = async (id) => { await upvoteIssue(id); await Promise.all([refresh(), refreshAll()]); setToast("Your backing has been recorded."); };
   return (
     <AppShell title="My reports">
       <div className="page">
         <PageHeader eyebrow="Resident activity" title="Your reports, in the open." description="Follow what you raised, see resident backing, and keep the ward office accountable to a visible status." action={<Link href="/report" className="button button-amber" data-testid="link-report-from-my-reports"><FilePlus2 size={15} />New report</Link>} />
         <div className="stat-grid">
-          <div className="stat-card featured"><div className="stat-label">Reports filed</div><div className="stat-value">{issues.length}</div><div className="stat-meta">in the your ward register</div></div>
+          <div className="stat-card featured"><div className="stat-label">Reports filed</div><div className="stat-value">{issues.length}</div><div className="stat-meta">in the civic register</div></div>
           <div className="stat-card"><div className="stat-label">Issues backed</div><div className="stat-value">{backedIssues.length}</div><div className="stat-meta">reports you support</div></div>
           <div className="stat-card"><div className="stat-label">Receiving action</div><div className="stat-value">{issues.filter((issue) => issue.status === "in_progress").length}</div><div className="stat-meta">currently in progress</div></div>
           <div className="stat-card"><div className="stat-label">Resolved</div><div className="stat-value band-amber">{issues.filter((issue) => issue.status === "resolved").length}</div><div className="stat-meta">closed by ward office</div></div>
         </div>
-        <section className="panel"><div className="panel-header"><div><h2>Filed by Ananya</h2><p>Most recent entries first</p></div><button className="quiet-button" onClick={() => { refresh(); refreshAll(); }} data-testid="button-refresh-my-reports"><Activity size={14} />Refresh</button></div>{isLoading ? <LoadingPanel rows={3} /> : error ? <ErrorPanel onRetry={refresh} /> : issues.length ? <div className="my-reports-grid" style={{ padding: 13 }}>{issues.map((issue) => <button className="report-card" key={issue.id} onClick={() => setSelected(issue)} style={{ textAlign: "left" }} data-testid={`card-my-report-${issue.id}`}><div className="report-card-head"><div><div className="eyebrow">{issue.id} · {formatShortDate(issue.created_at)}</div><h3 style={{ marginTop: 8 }}>{CATEGORY_LABELS[issue.category]}</h3></div><Score score={issue.priority_score} /></div><p>{issue.description}</p><div className="report-card-foot"><StatusChip status={issue.status} /><span>{issue.upvotes} resident backings</span></div></button>)}</div> : <div className="empty-state" data-testid="state-empty-my-reports"><FilePlus2 size={28} /><strong>No reports yet</strong><p>When you spot something that needs action, it will appear here.</p><Link href="/report" className="button button-amber" style={{ marginTop: 16 }} data-testid="link-first-report">File your first report</Link></div>}</section>
+        <section className="panel"><div className="panel-header"><div><h2>Filed by {me.name || "you"}</h2><p>Most recent entries first</p></div><button className="quiet-button" onClick={() => { refresh(); refreshAll(); }} data-testid="button-refresh-my-reports"><Activity size={14} />Refresh</button></div>{isLoading ? <LoadingPanel rows={3} /> : error ? <ErrorPanel onRetry={refresh} /> : issues.length ? <div className="my-reports-grid" style={{ padding: 13 }}>{issues.map((issue) => <button className="report-card" key={issue.id} onClick={() => setSelected(issue)} style={{ textAlign: "left" }} data-testid={`card-my-report-${issue.id}`}><div className="report-card-head"><div><div className="eyebrow">{issue.id} · {formatShortDate(issue.created_at)}</div><h3 style={{ marginTop: 8 }}>{CATEGORY_LABELS[issue.category]}</h3></div><Score score={issue.priority_score} /></div><p>{issue.description}</p><div className="report-card-foot"><StatusChip status={issue.status} /><span>{issue.upvotes} resident backings</span></div></button>)}</div> : <div className="empty-state" data-testid="state-empty-my-reports"><FilePlus2 size={28} /><strong>No reports yet</strong><p>When you spot something that needs action, it will appear here.</p><Link href="/report" className="button button-amber" style={{ marginTop: 16 }} data-testid="link-first-report">File your first report</Link></div>}</section>
         <section className="panel" style={{ marginTop: 15 }}><div className="panel-header"><div><h2>Backed by you</h2><p>Existing reports you have supported</p></div><ThumbsUp size={16} color="var(--muted)" /></div>{backedIssues.length ? <div className="my-reports-grid" style={{ padding: 13 }}>{backedIssues.map((issue) => <button className="report-card" key={issue.id} onClick={() => setSelected(issue)} style={{ textAlign: "left" }} data-testid={`card-backed-report-${issue.id}`}><div className="report-card-head"><div><div className="eyebrow">{issue.id} · {formatShortDate(issue.created_at)}</div><h3 style={{ marginTop: 8 }}>{CATEGORY_LABELS[issue.category]}</h3></div><Score score={issue.priority_score} /></div><p>{issue.description}</p><div className="report-card-foot"><StatusChip status={issue.status} /><span>{issue.upvotes} resident backings</span></div></button>)}</div> : <div className="empty-state"><ThumbsUp size={26} /><strong>No backed reports yet</strong><p>Back a nearby issue from the map to keep it visible here.</p><Link href="/map" className="button button-secondary" style={{ marginTop: 16 }}>Browse the ward map</Link></div>}</section>
       </div>
       <IssueDetailModal issue={selected} onClose={() => setSelected(null)} onUpvote={handleUpvote} />
@@ -794,6 +959,7 @@ function MyReportsPage() {
 function DirectionsModal({ issue, onClose, onStatus }) {
   const mapNode = useRef(null);
   const mapRef = useRef(null);
+  useMapAutosize(mapRef, mapNode);
   const lineRef = useRef(null);
   const youRef = useRef(null);
   const lastRoutedRef = useRef(null);
@@ -947,10 +1113,12 @@ function AdminPage() {
           <div className="stat-card"><div className="stat-label">Closed</div><div className="stat-value band-amber">{issues.filter((issue) => issue.status === "resolved").length}</div><div className="stat-meta">marked resolved</div></div>
         </div>
         <div className="admin-grid">
-          <section className="panel"><div className="panel-header"><div><h2>Priority triage</h2><p>Change a status to publish an accountable update.</p></div><span className="eyebrow">{filteredIssues.length} of {issues.length} records</span></div><div className="admin-filters"><div className="admin-search"><Search size={14} /><input value={adminSearch} onChange={(event) => setAdminSearch(event.target.value)} placeholder="Search ID, reporter or place" data-testid="input-admin-search" /></div><select className="filter-select" value={adminCategory} onChange={(event) => setAdminCategory(event.target.value)} data-testid="select-admin-category"><option value="all">All categories</option>{Object.entries(CATEGORY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><select className="filter-select" value={adminStatus} onChange={(event) => setAdminStatus(event.target.value)} data-testid="select-admin-status"><option value="all">All statuses</option>{Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>{isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filteredIssues.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>Photo</th><th>Issue</th><th>Priority</th><th>Filed</th><th>Evidence</th><th>Verified</th><th>Route</th><th>Status workflow</th></tr></thead><tbody>{filteredIssues.map((issue) => <tr key={issue.id}><td>{issue.photo_url ? (issue.media_type === "video" ? <video className="photo-thumb" src={issue.photo_url} muted data-testid={`video-thumb-${issue.id}`} /> : <img className="photo-thumb" src={issue.photo_url} alt={`Evidence for ${issue.id}`} data-testid={`photo-thumb-${issue.id}`} />) : <div className="photo-thumb photo-thumb-empty" data-testid={`photo-thumb-empty-${issue.id}`}><CloudUpload size={14} /></div>}</td><td><div className="table-title">{CATEGORY_LABELS[issue.category]}</div><div className="table-sub">{issue.id} · {locationLabel(issue)}</div></td><td><Score score={issue.priority_score} /></td><td><div className="table-sub">{formatDate(issue.created_at)}</div><div className="table-sub">{issue.reporter}</div></td><td>{issue.geo_source === "exif" && <div className="prov-tag prov-good" data-testid={`prov-exif-${issue.id}`}>photo GPS</div>}{issue.land_class === "private" && <div className="prov-tag prov-bad">private land</div>}{issue.land_class === "public" && <div className="prov-tag prov-good">public land</div>}{issue.video_url && <div className="prov-tag">video</div>}</td><td>{(() => { const c = Number(issue.confirmations || 0), d = Number(issue.disputes || 0), t = c + d;
-  if (!t) return <span className="table-sub">not checked yet</span>;
-  const pct = Math.round((c / t) * 100);
-  return <div className={`trust-inline ${pct >= 60 ? "trust-good" : pct >= 40 ? "trust-mixed" : "trust-poor"}`} data-testid={`trust-cell-${issue.id}`}><strong>{pct}%</strong><span>{c} yes · {d} no</span></div>;
+          <section className="panel"><div className="panel-header"><div><h2>Priority triage</h2><p>Change a status to publish an accountable update.</p></div><span className="eyebrow">{filteredIssues.length} of {issues.length} records</span></div><div className="admin-filters"><div className="admin-search"><Search size={14} /><input value={adminSearch} onChange={(event) => setAdminSearch(event.target.value)} placeholder="Search ID, reporter or place" data-testid="input-admin-search" /></div><select className="filter-select" value={adminCategory} onChange={(event) => setAdminCategory(event.target.value)} data-testid="select-admin-category"><option value="all">All categories</option>{Object.entries(CATEGORY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><select className="filter-select" value={adminStatus} onChange={(event) => setAdminStatus(event.target.value)} data-testid="select-admin-status"><option value="all">All statuses</option>{Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>{isLoading ? <LoadingPanel rows={5} /> : error ? <ErrorPanel onRetry={refresh} /> : filteredIssues.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>Photo</th><th>Issue</th><th>Priority</th><th>Filed</th><th>Evidence</th><th>Verified</th><th>Route</th><th>Status workflow</th></tr></thead><tbody>{filteredIssues.map((issue) => <tr key={issue.id} className={`row-standing-${communityStanding(issue).key}`} data-testid={`row-issue-${issue.id}`}><td>{issue.photo_url ? (issue.media_type === "video" ? <video className="photo-thumb" src={issue.photo_url} muted data-testid={`video-thumb-${issue.id}`} /> : <img className="photo-thumb" src={issue.photo_url} alt={`Evidence for ${issue.id}`} data-testid={`photo-thumb-${issue.id}`} />) : <div className="photo-thumb photo-thumb-empty" data-testid={`photo-thumb-empty-${issue.id}`}><CloudUpload size={14} /></div>}</td><td><div className="table-title">{CATEGORY_LABELS[issue.category]}</div><div className="table-sub">{issue.id} · {locationLabel(issue)}</div></td><td><Score score={issue.priority_score} /></td><td><div className="table-sub">{formatDate(issue.created_at)}</div><div className="table-sub">{issue.reporter}</div></td><td>{issue.geo_source === "exif" && <div className="prov-tag prov-good" data-testid={`prov-exif-${issue.id}`}>photo GPS</div>}{issue.land_class === "private" && <div className="prov-tag prov-bad" title={issue.private_ack ? "The reporter was warned and filed anyway" : ""}>private land{issue.private_ack ? " · confirmed" : ""}</div>}{issue.land_class === "public" && <div className="prov-tag prov-good">public land</div>}{issue.video_url && <div className="prov-tag">video</div>}</td><td>{(() => { const st = communityStanding(issue);
+  if (st.key === "unchecked") return <span className="table-sub">not checked yet</span>;
+  return <div className={`trust-inline trust-${st.key}`} data-testid={`trust-cell-${issue.id}`}>
+    <strong>{st.key === "verified" ? "✓ Verified" : st.key === "disputed" ? "Disputed" : `${st.confirmed}/${VERIFIED_AT}`}</strong>
+    <span>{st.confirmed} yes · {st.disputed} no</span>
+  </div>;
 })()}</td><td><button type="button" className="quiet-button" onClick={() => setRouting(issue)} data-testid={`button-route-${issue.id}`}><Navigation size={13} />Directions</button></td><td><select className="filter-select status-select" value={issue.status} onChange={(event) => handleStatus(issue.id, event.target.value)} data-testid={`select-status-${issue.id}`}><option value="pending">Pending review</option><option value="in_progress">In progress</option><option value="resolved">Resolved</option></select></td></tr>)}</tbody></table></div> : <div className="empty-state" data-testid="state-empty-admin"><Search size={26} /><strong>No matching register entries</strong><p>Adjust the search or filters to widen the triage view.</p></div>}</section>
           <aside className="panel"><div className="panel-header"><div><h2>Register shape</h2><p>Reports by category</p></div><SlidersHorizontal size={16} color="var(--muted)" /></div><div className="bar-list">{counts.map(({ category, count }) => <div className="bar-item" key={category}><span>{CATEGORY_LABELS[category]}</span><div className="bar-track"><div className="bar-fill" style={{ width: `${(count / maxCount) * 100}%` }} /></div><strong>{count}</strong></div>)}</div><div className="panel-body" style={{ borderTop: "1px solid var(--line)" }}><div className="eyebrow">Service signal</div><div className="metric-list"><div className="metric-row"><span>Average priority</span><strong>{issues.length ? Math.round(issues.reduce((sum, issue) => sum + issue.priority_score, 0) / issues.length) : 0}</strong></div><div className="metric-row"><span>Resident backing</span><strong>{issues.reduce((sum, issue) => sum + issue.upvotes, 0)}</strong></div><div className="metric-row"><span>Resolution rate</span><strong>{issues.length ? `${Math.round((issues.filter((issue) => issue.status === "resolved").length / issues.length) * 100)}%` : "0%"}</strong></div></div></div></aside>
         </div>
@@ -1045,7 +1213,7 @@ function AuthPage() {
             catch (err) { setError(err.message || "Google sign-in failed."); }
             finally { setBusy(false); }
           }}
-        /><h2>{mode === "signin" ? "Welcome back." : "Join the ward register."}</h2><p className="subhead">{mode === "signin" ? "Sign in to follow reports and back the issues your street needs fixed." : "Create a local account to file reports and keep a visible record of action."}</p><div className="auth-tabs"><button className={`auth-tab ${mode === "signin" ? "active" : ""}`} onClick={() => { setMode("signin"); setError(""); }} data-testid="button-auth-signin">Sign in</button><button className={`auth-tab ${mode === "register" ? "active" : ""}`} onClick={() => { setMode("register"); setError(""); }} data-testid="button-auth-register">Create account</button></div><form className="auth-form" onSubmit={submit}>{mode === "register" && <div className="field"><label htmlFor="auth-name">Full name</label><input id="auth-name" className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="Ananya Rao" data-testid="input-auth-name" /></div>}<div className="field"><label htmlFor="auth-email">Email address</label><input id="auth-email" className="input" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" data-testid="input-auth-email" /></div><div className="field"><label htmlFor="auth-password">Password</label><input id="auth-password" className="input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" data-testid="input-auth-password" /></div>{error && <div className="auth-note" role="alert" data-testid="status-auth-error">{error}</div>}<button type="submit" className="button button-primary" disabled={busy} data-testid="button-submit-auth">{busy ? "Opening your register…" : mode === "signin" ? "Sign in to CivicFix" : "Create resident account"}<ArrowRight size={15} /></button></form><p className="auth-legal">By continuing, you agree that reports are visible to other residents in your ward. This demo uses local mock data only; no account details leave this device.</p></div></section>
+        /><h2>{mode === "signin" ? "Welcome back." : "Create your account."}</h2><p className="subhead">{mode === "signin" ? "Sign in to follow reports and back the issues your street needs fixed." : "Create a local account to file reports and keep a visible record of action."}</p><div className="auth-tabs"><button className={`auth-tab ${mode === "signin" ? "active" : ""}`} onClick={() => { setMode("signin"); setError(""); }} data-testid="button-auth-signin">Sign in</button><button className={`auth-tab ${mode === "register" ? "active" : ""}`} onClick={() => { setMode("register"); setError(""); }} data-testid="button-auth-register">Create account</button></div><form className="auth-form" onSubmit={submit}>{mode === "register" && <div className="field"><label htmlFor="auth-name">Full name</label><input id="auth-name" className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="Your full name" data-testid="input-auth-name" /></div>}<div className="field"><label htmlFor="auth-email">Email address</label><input id="auth-email" className="input" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" data-testid="input-auth-email" /></div><div className="field"><label htmlFor="auth-password">Password</label><input id="auth-password" className="input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" data-testid="input-auth-password" /></div>{error && <div className="auth-note" role="alert" data-testid="status-auth-error">{error}</div>}<button type="submit" className="button button-primary" disabled={busy} data-testid="button-submit-auth">{busy ? "Opening your register…" : mode === "signin" ? "Sign in to CivicFix" : "Create resident account"}<ArrowRight size={15} /></button></form><p className="auth-legal">By continuing, you agree that reports are visible to other residents nearby. This demo uses local mock data only; no account details leave this device.</p></div></section>
     </div>
   );
 }
@@ -1062,8 +1230,18 @@ function NotFoundPage() {
 
 function Protected({ component: Component }) {
   const [, setLocation] = useLocation();
-  const allowed = isAuthed();
+  const [allowed, setAllowed] = useState(isAuthed());
+
   useEffect(() => { if (!allowed) setLocation("/auth"); }, [allowed, setLocation]);
+
+  /* api.js fires this the moment the server rejects a token, so an expired session
+     lands on the sign-in page instead of leaving blank panels behind. */
+  useEffect(() => {
+    const onSignedOut = () => { setAllowed(false); setLocation("/auth"); };
+    window.addEventListener("civicfix:signed-out", onSignedOut);
+    return () => window.removeEventListener("civicfix:signed-out", onSignedOut);
+  }, [setLocation]);
+
   if (!allowed) return null;
   return <Component />;
 }

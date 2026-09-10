@@ -309,12 +309,28 @@ h3 { font-family: var(--font-display); font-size: 15px; }
 }
 @media (max-width: 760px) {
   .app-shell { display: block; }
-  .sidebar { position: fixed; inset: auto 0 0; height: auto; padding: 8px 10px; display: block; border-top: 1px solid #29445d; }
-  .brand, .nav-label, .ward-card, .profile-strip { display: none; }
-  .nav-list { display: grid; grid-template-columns: repeat(5, 1fr); gap: 3px; }
-  .nav-link { flex-direction: column; padding: 8px 3px; gap: 4px; border-radius: 7px; font-size: 9px; text-align: center; }
-  .nav-link.active { box-shadow: inset 0 2px 0 var(--amber); }
-  .nav-link svg { width: 16px; height: 16px; }
+
+  /* The sidebar becomes a drawer: off-screen until the menu button opens it,
+     showing the same content as on desktop rather than a stripped-down bar. */
+  .sidebar {
+    position: fixed; top: 0; left: 0; bottom: 0; width: min(84vw, 310px);
+    height: 100dvh; z-index: 1200; overflow-y: auto;
+    transform: translateX(-102%); transition: transform .24s ease;
+    box-shadow: none;
+  }
+  .sidebar-open { transform: translateX(0); box-shadow: 22px 0 60px rgba(6, 18, 32, .45); }
+  .drawer-scrim {
+    position: fixed; inset: 0; z-index: 1150;
+    background: rgba(6, 18, 32, .55); backdrop-filter: blur(2px);
+    animation: fade-in .18s ease;
+  }
+  .drawer-close {
+    position: absolute; top: 14px; right: 14px;
+    display: grid; place-items: center; width: 32px; height: 32px;
+    border: 1px solid #29445d; border-radius: 9px;
+    background: rgba(255, 255, 255, .06); color: #cfdae6; cursor: pointer;
+  }
+  .drawer-close:hover { background: rgba(255, 255, 255, .12); }
   .topbar { height: 62px; padding: 0 17px; }
   .mobile-menu { display: block; margin-right: 9px; }
   .topbar-title { font-size: 14px; }
@@ -474,3 +490,95 @@ h3 { font-family: var(--font-display); font-size: 15px; }
   text-transform: uppercase; letter-spacing: .08em;
 }
 .auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+
+.drawer-close { display: none; }
+@media (max-width: 760px) { .drawer-close { display: grid; } }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+
+/* ---- installed app: respect the phone's safe areas ---- */
+@supports (padding: env(safe-area-inset-top)) {
+  .topbar { padding-top: env(safe-area-inset-top); height: calc(62px + env(safe-area-inset-top)); }
+  .sidebar { padding-top: max(18px, env(safe-area-inset-top)); padding-bottom: max(18px, env(safe-area-inset-bottom)); }
+  .map-recentre { bottom: calc(96px + env(safe-area-inset-bottom)); }
+}
+
+/* stop iOS zooming the page when a field is focused */
+@media (max-width: 760px) {
+  input, select, textarea { font-size: 16px; }
+}
+
+/* ---- community standing: verified, disputed, still being checked ---- */
+
+/* A verified report is a different kind of thing from a claim, so it reads differently
+   wherever it appears — in the queue, in the modal, in the ward office table. */
+.standing-banner {
+  display: flex; gap: 12px; align-items: flex-start;
+  padding: 14px 20px; border-bottom: 1px solid var(--line);
+}
+.standing-banner strong { display: block; font-size: 14px; letter-spacing: -.01em; }
+.standing-banner span { display: block; margin-top: 2px; font-size: 12.5px; line-height: 1.5; }
+
+.banner-verified {
+  background: linear-gradient(90deg, rgba(47,125,91,.16), rgba(47,125,91,.05));
+  color: #23694b; border-bottom-color: rgba(47,125,91,.3);
+}
+.banner-verified strong { color: #1d5a3f; }
+.banner-disputed {
+  background: linear-gradient(90deg, rgba(183,71,63,.16), rgba(183,71,63,.05));
+  color: #9c3a33; border-bottom-color: rgba(183,71,63,.3);
+}
+.banner-checking {
+  background: var(--surface-2); color: var(--muted); border-bottom-color: var(--line);
+}
+.banner-checking strong { color: var(--ink); }
+
+.queue-card.standing-verified {
+  background: rgba(47,125,91,.055);
+  box-shadow: inset 3px 0 0 #2f7d5b;
+}
+.queue-card.standing-disputed {
+  background: rgba(183,71,63,.05);
+  box-shadow: inset 3px 0 0 #b7473f;
+}
+
+.verified-chip, .disputed-chip {
+  display: inline-flex; align-items: center; gap: 4px; margin-left: 8px;
+  padding: 1px 7px; border-radius: 999px;
+  font-size: 10px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+  vertical-align: 1px;
+}
+.verified-chip { background: rgba(47,125,91,.15); color: #2f7d5b; }
+.disputed-chip { background: rgba(183,71,63,.14); color: #b7473f; }
+
+.row-standing-verified { background: rgba(47,125,91,.045); }
+.row-standing-verified td:first-child { box-shadow: inset 3px 0 0 #2f7d5b; }
+.row-standing-disputed { background: rgba(183,71,63,.04); }
+.row-standing-disputed td:first-child { box-shadow: inset 3px 0 0 #b7473f; }
+
+.trust-verified { background: rgba(47,125,91,.12); color: #2f7d5b; }
+.trust-disputed { background: rgba(183,71,63,.12); color: #b7473f; }
+.trust-checking { background: var(--surface-2); color: var(--muted); }
+
+/* ---- private-land confirmation ---- */
+.private-choice { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.private-ack {
+  display: inline-flex; align-items: center; gap: 6px; margin-top: 10px;
+  padding: 5px 10px; border-radius: 8px;
+  background: rgba(47,125,91,.12); color: #2f7d5b; font-size: 12.5px; font-weight: 600;
+}
+.evidence-checklist .warn { color: #b7473f; font-weight: 600; }
+
+
+/* ---- maps on a phone ---- */
+/* A Leaflet container with no height renders as nothing at all. On narrow screens the
+   grid that gives these panes their height collapses, so pin one on explicitly. */
+@media (max-width: 900px) {
+  .map-wrap, .map-wrap > div,
+  .map-pane, .map-panel { min-height: 320px; }
+  .report-map-wrap, .report-map-wrap > div { min-height: 260px; }
+  .directions-map, .directions-map > div { min-height: 260px; }
+}
+
+.leaflet-container { touch-action: pan-x pan-y; }
